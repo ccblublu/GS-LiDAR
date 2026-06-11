@@ -18,3 +18,5 @@ train.sh
 
 chamfer/tmp/*
 .ipynb_checkpoints
+*.egg
+*.egg-info

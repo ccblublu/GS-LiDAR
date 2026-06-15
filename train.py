@@ -160,9 +160,38 @@ def training(args):
             loss += args.lambda_t_reg * loss_t_reg
 
         if args.lambda_v_reg > 0:
-            loss_v_reg = torch.abs(v_map).mean()
+            # OD-aware velocity regularization: differentiate static vs dynamic
+            velocity = gaussians.get_inst_velocity  # (N, 3)
+            is_dynamic = gaussians.get_is_dynamic  # (N, 1) bool
+
+            lambda_v_static = getattr(args, 'lambda_v_reg_static', args.lambda_v_reg)
+            lambda_v_dynamic = getattr(args, 'lambda_v_reg_dynamic', args.lambda_v_reg)
+
+            if is_dynamic.any():
+                static_mask = ~is_dynamic[:, 0]
+                dynamic_mask = is_dynamic[:, 0]
+
+                # Static: strong regularization, push velocity to zero
+                if static_mask.any():
+                    loss_v_static = torch.abs(velocity[static_mask]).mean()
+                else:
+                    loss_v_static = torch.tensor(0.0, device="cuda")
+
+                # Dynamic: weak regularization, allow free motion
+                if dynamic_mask.any():
+                    loss_v_dynamic = torch.abs(velocity[dynamic_mask]).mean()
+                else:
+                    loss_v_dynamic = torch.tensor(0.0, device="cuda")
+
+                loss_v_reg = lambda_v_static * loss_v_static + lambda_v_dynamic * loss_v_dynamic
+                log_dict['loss_v_static'] = loss_v_static.item()
+                log_dict['loss_v_dynamic'] = loss_v_dynamic.item()
+            else:
+                # No OD labels, use uniform regularization on rendered v_map
+                loss_v_reg = torch.abs(v_map).mean()
+
             log_dict['loss_v_reg'] = loss_v_reg.item()
-            loss += args.lambda_v_reg * loss_v_reg
+            loss += loss_v_reg
 
         # Intensity sh
         if args.lambda_intensity_sh > 0:
@@ -318,7 +347,7 @@ def training(args):
                     raydrop_map = visualize_depth(raydrop_map, near=0.01, far=1)
                     other_img.append(raydrop_map)
 
-                    gt_raydrop = 1.0 - (viewpoint_cam.pts_depth > 0).float()
+                    gt_raydrop = 1.0 - (viewpoint_cam.pts_depth.cuda() > 0).float()
                     gt_raydrop = visualize_depth(gt_raydrop, near=0.01, far=1)
                     other_img.append(gt_raydrop)
 
@@ -328,8 +357,8 @@ def training(args):
                     intensity_sh_map = intensity_sh_map.clamp(0.0, 1.0).repeat(3, 1, 1)
                     other_img.append(intensity_sh_map)
 
-                    mask = (viewpoint_cam.pts_depth > 0).float()
-                    pts_intensity_vis = viewpoint_cam.pts_intensity.clamp(0.0, 1.0).repeat(3, 1, 1)
+                    mask = (viewpoint_cam.pts_depth.cuda() > 0).float()
+                    pts_intensity_vis = viewpoint_cam.pts_intensity.cuda().clamp(0.0, 1.0).repeat(3, 1, 1)
                     other_img.append(pts_intensity_vis)
 
                 if args.lambda_normal_consistency > 0:
@@ -365,6 +394,7 @@ def training(args):
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/ckpt/chkpnt" + str(iteration) + ".pth")
                 torch.save((lidar_raydrop_prior.capture(), iteration), scene.model_path + "/ckpt/lidar_raydrop_prior_chkpnt" + str(iteration) + ".pth")
 
+    return
 
 def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderArgs, log_dict, env_map=None):
     if iteration in test_iterations or iteration == 1:
@@ -713,12 +743,14 @@ if __name__ == "__main__":
 
     if not args.test_only:
         training(args)
-
+        torch.cuda.empty_cache()
     # Training done
     print("\nTraining complete.")
 
     if not args.test_only:
         refine()
+        torch.cuda.empty_cache()
+
     refine_test()
     print("\nRefine complete.")
     sys.stdout = sys.__stdout__

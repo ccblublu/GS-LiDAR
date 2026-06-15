@@ -65,22 +65,30 @@ def fetchPly(path):
         timestamp = vertices['time'][:, None]
     else:
         timestamp = None
-    return BasicPointCloud(points=positions, colors=colors, normals=normals, time=timestamp)
+    if 'is_dynamic' in vertices:
+        is_dynamic = vertices['is_dynamic'][:, None].astype(np.float32)
+    else:
+        is_dynamic = None
+    return BasicPointCloud(points=positions, colors=colors, normals=normals, time=timestamp, is_dynamic=is_dynamic)
 
 
-def storePly(path, xyz, rgb, timestamp=None):
+def storePly(path, xyz, rgb, timestamp=None, is_dynamic=None):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
              ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
              ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
-             ('time', 'f4')]
+             ('time', 'f4'), ('is_dynamic', 'u1')]
 
     normals = np.zeros_like(xyz)
     if timestamp is None:
         timestamp = np.zeros_like(xyz[:, :1])
+    if is_dynamic is None:
+        is_dynamic = np.zeros_like(xyz[:, :1], dtype=np.uint8)
+    else:
+        is_dynamic = is_dynamic.astype(np.uint8)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
-    attributes = np.concatenate((xyz, normals, rgb, timestamp), axis=1)
+    attributes = np.concatenate((xyz, normals, rgb, timestamp, is_dynamic), axis=1)
     elements[:] = list(map(tuple, attributes))
 
     # Create the PlyData object and write to file

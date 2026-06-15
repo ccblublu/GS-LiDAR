@@ -43,8 +43,9 @@ class Camera(nn.Module):
         self.image_width = resolution[0]
         self.image_height = resolution[1]
 
-        self.pts_depth = pts_depth.to(self.data_device) if pts_depth is not None else pts_depth
-        self.pts_intensity = pts_intensity.to(self.data_device) if pts_intensity is not None else pts_intensity
+        # Store GT depth/intensity on CPU to save GPU memory; move to GPU on access via .cuda()
+        self.pts_depth = pts_depth.cpu() if pts_depth is not None else pts_depth
+        self.pts_intensity = pts_intensity.cpu() if pts_intensity is not None else pts_intensity
 
         self.zfar = 1000.0
         self.znear = 0.01

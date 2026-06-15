@@ -58,7 +58,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    root_path = f"eval_output/kitti360_reconstruction/{args.seq}"
+    root_path = f"eval_output/gacrt_reconstruction/{args.seq}"
     with open(os.path.join(root_path, "scale_factor.txt"), 'r') as file:
         data = file.read()
         scale_factor = float(data)

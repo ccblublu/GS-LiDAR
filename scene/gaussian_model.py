@@ -57,6 +57,7 @@ class GaussianModel:
         self._velocity = torch.empty(0)
 
         self._intensity = torch.empty(0)
+        self._is_dynamic = torch.empty(0)  # (N, 1) float, 1=dynamic, 0=static; buffer not param
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -103,6 +104,7 @@ class GaussianModel:
             self.spatial_lr_scale,
             self.T,
             self.velocity_decay,
+            self._is_dynamic,
         )
 
     def restore(self, model_args, training_args=None):
@@ -126,6 +128,7 @@ class GaussianModel:
          self.spatial_lr_scale,
          self.T,
          self.velocity_decay,
+         self._is_dynamic,
          ) = model_args
         self.setup_functions()
         if training_args is not None:
@@ -154,7 +157,11 @@ class GaussianModel:
 
     @property
     def get_inst_velocity(self):
-        return self._velocity * torch.exp(-self.get_scaling_t / self.T / 2 * self.velocity_decay)
+        v = self._velocity * torch.exp(-self.get_scaling_t / self.T / 2 * self.velocity_decay)
+        # Static Gaussians have zero velocity
+        if self._is_dynamic.shape[0] > 0:
+            v = torch.where(self._is_dynamic > 0.5, v, torch.zeros_like(v))
+        return v
 
     @property
     def get_xyz(self):
@@ -179,11 +186,19 @@ class GaussianModel:
         return self.intensity_activation(self._intensity)
 
     @property
+    def get_is_dynamic(self):
+        return self._is_dynamic > 0.5  # (N, 1) bool tensor
+
+    @property
     def get_max_sh_channels(self):
         return (self.max_sh_degree + 1) ** 2
 
     def get_marginal_t(self, timestamp):
-        return torch.exp(-0.5 * (self.get_t - timestamp) ** 2 / self.get_scaling_t ** 2)
+        marginal = torch.exp(-0.5 * (self.get_t - timestamp) ** 2 / self.get_scaling_t ** 2)
+        # Static Gaussians are always visible regardless of time
+        if self._is_dynamic.shape[0] > 0:
+            marginal = torch.where(self._is_dynamic > 0.5, marginal, torch.ones_like(marginal))
+        return marginal
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -259,6 +274,27 @@ class GaussianModel:
         scales_t = self.scaling_t_inverse_activation(torch.sqrt(dist_t))
         velocity = torch.full((fused_point_cloud.shape[0], 3), 0., device="cuda")
 
+        # Initialize is_dynamic from point cloud OD labels
+        if pcd.is_dynamic is not None and pcd.is_dynamic.shape[0] == fused_point_cloud.shape[0]:
+            is_dynamic = torch.from_numpy(pcd.is_dynamic.copy()).float().cuda()
+        elif pcd.is_dynamic is not None and pcd.is_dynamic.shape[0] == pcd.points.shape[0]:
+            # is_dynamic only covers original points, pad for random_init_point
+            is_dynamic_orig = torch.from_numpy(pcd.is_dynamic.copy()).float().cuda()
+            is_dynamic_extra = torch.zeros((fused_point_cloud.shape[0] - pcd.points.shape[0], 1), device="cuda")
+            is_dynamic = torch.cat([is_dynamic_orig, is_dynamic_extra], dim=0)
+        else:
+            is_dynamic = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+
+        # Initialize velocity from OD tracking (override zeros for dynamic points)
+        if pcd.init_velocity is not None and pcd.init_velocity.shape[0] == fused_point_cloud.shape[0]:
+            init_vel = torch.from_numpy(pcd.init_velocity.copy()).float().cuda()
+            velocity = torch.where(is_dynamic > 0.5, init_vel, velocity)
+        elif pcd.init_velocity is not None and pcd.init_velocity.shape[0] == pcd.points.shape[0]:
+            init_vel_orig = torch.from_numpy(pcd.init_velocity.copy()).float().cuda()
+            init_vel_extra = torch.zeros((fused_point_cloud.shape[0] - pcd.points.shape[0], 3), device="cuda")
+            init_vel = torch.cat([init_vel_orig, init_vel_extra], dim=0)
+            velocity = torch.where(is_dynamic > 0.5, init_vel, velocity)
+
         opacities = inverse_sigmoid(self.init_opa * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         intensities = inverse_sigmoid(0.01 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
@@ -274,6 +310,7 @@ class GaussianModel:
         self._scaling_t = nn.Parameter(scales_t.requires_grad_(True))
         self._velocity = nn.Parameter(velocity.requires_grad_(True))
         self._intensity = nn.Parameter(intensities.requires_grad_(True))
+        self._is_dynamic = is_dynamic  # buffer, not a parameter
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -384,6 +421,7 @@ class GaussianModel:
         else:
             self._velocity = optimizable_tensors['velocity']
         self.t_gradient_accum = self.t_gradient_accum[valid_points_mask]
+        self._is_dynamic = self._is_dynamic[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -412,7 +450,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_t, new_scaling_t, new_velocity, new_intensity):
+                              new_rotation, new_t, new_scaling_t, new_velocity, new_intensity, new_is_dynamic=None):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -440,6 +478,14 @@ class GaussianModel:
             self._velocity = optimizable_tensors['velocity']
 
         self._intensity = optimizable_tensors['intensity']
+
+        # Handle _is_dynamic buffer (not in optimizer, concatenate manually)
+        if new_is_dynamic is not None:
+            self._is_dynamic = torch.cat((self._is_dynamic, new_is_dynamic), dim=0)
+        else:
+            # Default: inherit from parent (use zeros as fallback)
+            self._is_dynamic = torch.cat((self._is_dynamic,
+                                          torch.zeros((new_xyz.shape[0], 1), device="cuda")), dim=0)
 
         self.t_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
@@ -525,8 +571,11 @@ class GaussianModel:
             new_scaling_t = self.scaling_t_inverse_activation(
                 self.get_scaling_t[selected_pts_mask].repeat(N, 1))
 
+        # Inherit is_dynamic from parent Gaussians
+        new_is_dynamic = self._is_dynamic[selected_pts_mask].repeat(N, 1)
+
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation,
-                                   new_t, new_scaling_t, new_velocity, new_intensity)
+                                   new_t, new_scaling_t, new_velocity, new_intensity, new_is_dynamic)
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
@@ -564,8 +613,11 @@ class GaussianModel:
 
         new_intensity = self._intensity[selected_pts_mask]
 
+        # Inherit is_dynamic from parent Gaussians
+        new_is_dynamic = self._is_dynamic[selected_pts_mask]
+
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_t, new_scaling_t, new_velocity, new_intensity)
+                                   new_rotation, new_t, new_scaling_t, new_velocity, new_intensity, new_is_dynamic)
 
     def densify_and_prune(self, max_grad, max_grad_abs, min_opacity, extent, max_screen_size, max_grad_t=None, prune_only=False):
         prune_mask = self.max_radii2D < 0.707

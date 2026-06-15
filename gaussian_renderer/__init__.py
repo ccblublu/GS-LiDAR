@@ -111,7 +111,12 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
     # Prefilter
     mask = (opacity[:, 0] > 1 / 255) if mask is None else mask & (opacity[:, 0] > 1 / 255)
     if pipe.dynamic:
-        mask = mask & (marginal_t[:, 0] > 0.05)
+        # Static Gaussians (is_dynamic=False) are exempt from temporal mask
+        if pc._is_dynamic.shape[0] > 0 and pc._is_dynamic.shape[0] == opacity.shape[0]:
+            temporal_mask = (marginal_t[:, 0] > 0.05) | (~pc.get_is_dynamic[:, 0])
+        else:
+            temporal_mask = marginal_t[:, 0] > 0.05
+        mask = mask & temporal_mask
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
     contrib, rendered_image, rendered_feature, rendered_depth, rendered_opacity, radii = rasterizer(
@@ -169,8 +174,8 @@ def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, rende
     gt_intensity_pano = torch.zeros([1, h, w * 2]).cuda()
 
     for idx, viewpoint in enumerate([cam_front, cam_back]):
-        depth_gt = viewpoint.pts_depth
-        intensity_gt = viewpoint.pts_intensity
+        depth_gt = viewpoint.pts_depth.cuda() if viewpoint.pts_depth is not None else viewpoint.pts_depth
+        intensity_gt = viewpoint.pts_intensity.cuda() if viewpoint.pts_intensity is not None else viewpoint.pts_intensity
         render_pkg = renderFunc(viewpoint, gaussians, *renderArgs, env_map=env_map)
 
         depth = render_pkg['depth']

@@ -13,9 +13,11 @@ from utils.camera_utils import cameraList_from_camInfos
 from utils.general_utils import shuffle_by_pairs
 from utils.misc import pointList_from_cams
 from scene.kitti360_loader import readKitti360Info
+from scene.gacrt_loader import readGacrtInfo
 
 sceneLoadTypeCallbacks = {
     "Kitti360": readKitti360Info,
+    "Gacrt": readGacrtInfo,
 }
 
 

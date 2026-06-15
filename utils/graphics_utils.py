@@ -17,6 +17,8 @@ class BasicPointCloud(NamedTuple):
     colors: np.array
     normals: np.array
     time: np.array = None
+    is_dynamic: np.array = None      # (N, 1) float, 1=dynamic, 0=static
+    init_velocity: np.array = None   # (N, 3) float, per-point initial velocity
 
 
 def getWorld2View(R, t):

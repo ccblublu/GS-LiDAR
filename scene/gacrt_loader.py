@@ -52,6 +52,77 @@ def load_pkl_compat(path_or_file):
         return NumpyCompatUnpickler(path_or_file).load()
 
 
+def iter_pkl_frames(pkl_data):
+    """遍历 pkl 中所有唯一帧（关键帧 + sweep），与 preprocess/gacrt_to_gs.py 展开逻辑一致。
+
+    Yields:
+        dict with keys: timestamp, ego2global, instances, lidar_path, pkl_type, keyframe_idx
+    """
+    seen_paths = set()
+    for kf_idx, item in enumerate(pkl_data):
+        ego2global = item["ego2global"]
+        kf_instances = item.get("instances", [])
+
+        kf_path = item["lidar_points"]["lidar_path"]
+        if kf_path not in seen_paths:
+            seen_paths.add(kf_path)
+            yield {
+                "timestamp": item["timestamp"],
+                "ego2global": ego2global,
+                "instances": kf_instances,
+                "lidar_path": kf_path,
+                "pkl_type": "keyframe",
+                "keyframe_idx": kf_idx,
+            }
+
+        for sweep in item.get("lidar_sweeps", []):
+            sp = sweep["lidar_points"]
+            sp_path = sp["lidar_path"]
+            if sp_path in seen_paths:
+                continue
+            seen_paths.add(sp_path)
+            if "instances" in sweep:
+                yield {
+                    "timestamp": sweep["timestamp"],
+                    "ego2global": sp["ego2global"],
+                    "instances": sweep["instances"],
+                    "lidar_path": sp_path,
+                    "pkl_type": "sweep",
+                    "keyframe_idx": kf_idx,
+                }
+            else:
+                # 少数早于关键帧的 sweep 无独立标注，回退到所属关键帧
+                yield {
+                    "timestamp": sweep["timestamp"],
+                    "ego2global": ego2global,
+                    "instances": kf_instances,
+                    "lidar_path": sp_path,
+                    "pkl_type": "sweep",
+                    "keyframe_idx": kf_idx,
+                }
+
+
+def extract_od_annotations(instances, ego2global, moving_obj_ids):
+    """从 instances 提取移动目标的世界坐标系 bbox 列表。"""
+    annotations = []
+    for inst in instances:
+        obj_id = inst["obj_ids"]
+        if obj_id not in moving_obj_ids:
+            continue
+        bbox_world = transform_bbox_to_world(inst["bbox_3d"], ego2global)
+        annotations.append((obj_id, bbox_world))
+    return annotations
+
+
+def build_od_annotations_by_lidar_path(pkl_data, moving_obj_ids):
+    """按 lidar_path 预计算每帧 OD 标注（关键帧 + sweep）。"""
+    od_by_path = {}
+    for frame in iter_pkl_frames(pkl_data):
+        od_by_path[frame["lidar_path"]] = extract_od_annotations(
+            frame["instances"], frame["ego2global"], moving_obj_ids)
+    return od_by_path
+
+
 def identify_moving_objects(pkl_data, dynamic_labels, min_displacement=0.5):
     """通过 obj_id 追踪识别真正移动中的目标。
 
@@ -70,10 +141,10 @@ def identify_moving_objects(pkl_data, dynamic_labels, min_displacement=0.5):
     # 收集每个 obj_id 的轨迹: [(timestamp, center_world)]
     obj_trajectories = defaultdict(list)
 
-    for idx, item in enumerate(pkl_data):
-        ego2global = item["ego2global"]
-        timestamp = item["timestamp"]
-        for inst in item.get("instances", []):
+    for frame in iter_pkl_frames(pkl_data):
+        ego2global = frame["ego2global"]
+        timestamp = frame["timestamp"]
+        for inst in frame["instances"]:
             label = inst["bbox_label_3d"]
             if label not in dynamic_labels:
                 continue
@@ -224,8 +295,8 @@ def readGacrtInfo(args):
     # --- OD annotation loading ---
     moving_obj_ids = set()
     obj_velocities = {}
-    # Build keyframe_idx → list of OD annotations (in world frame)
-    keyframe_od_annotations = {}  # keyframe_idx → list of (obj_id, bbox_world_dict)
+    # lidar_path → list of OD annotations (in world frame)
+    od_annotations_by_path = {}
 
     if use_od_labels:
         # Load pkl for OD annotations
@@ -247,21 +318,14 @@ def readGacrtInfo(args):
         moving_obj_ids, obj_velocities = identify_moving_objects(
             pkl_data, dynamic_labels, min_disp)
 
-        # Pre-compute world-frame bboxes for each keyframe
-        for kf_idx, item in enumerate(pkl_data):
-            ego2global = item["ego2global"]
-            annotations = []
-            for inst in item.get("instances", []):
-                obj_id = inst["obj_ids"]
-                # Only include moving objects
-                if obj_id not in moving_obj_ids:
-                    continue
-                bbox_3d = inst["bbox_3d"]
-                bbox_world = transform_bbox_to_world(bbox_3d, ego2global)
-                annotations.append((obj_id, bbox_world))
-            keyframe_od_annotations[kf_idx] = annotations
+        # Pre-compute world-frame bboxes for each unique frame (keyframe + sweep)
+        od_annotations_by_path = build_od_annotations_by_lidar_path(
+            pkl_data, moving_obj_ids)
 
-        print(f"[OD] Loaded annotations for {len(pkl_data)} keyframes, "
+        n_sweep_frames = sum(
+            1 for frame in iter_pkl_frames(pkl_data) if frame["pkl_type"] == "sweep")
+        print(f"[OD] Loaded annotations for {len(od_annotations_by_path)} unique frames "
+              f"({len(pkl_data)} keyframes + {n_sweep_frames} sweeps), "
               f"{len(moving_obj_ids)} moving objects tracked")
 
     point_list = []
@@ -341,10 +405,13 @@ def readGacrtInfo(args):
         is_dynamic_frame = np.zeros((n_pts, 1), dtype=np.float32)
         init_velocity_frame = np.zeros((n_pts, 3), dtype=np.float32)
 
-        if use_od_labels and keyframe_od_annotations:
-            # Use parent keyframe's OD annotations
-            kf_idx = pose_info.get("idx", frame_idx)
-            annotations = keyframe_od_annotations.get(kf_idx, [])
+        if use_od_labels and od_annotations_by_path:
+            # Look up per-frame OD by lidar_path (sweep has its own annotations)
+            frame_lidar_path = pose_info.get("lidar_path")
+            if frame_lidar_path is None and "idx" in pose_info:
+                pkl_item = pkl_data[pose_info["idx"]]
+                frame_lidar_path = pkl_item["lidar_points"]["lidar_path"]
+            annotations = od_annotations_by_path.get(frame_lidar_path, [])
 
             if annotations:
                 # Collect world-frame bboxes for moving objects only

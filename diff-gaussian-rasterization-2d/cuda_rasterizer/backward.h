@@ -45,7 +45,8 @@ namespace BACKWARD
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
-		const float scale_factor);
+		const float scale_factor,
+		const float near_dist);
 
 	void preprocess(
 		int P, int D, int M,

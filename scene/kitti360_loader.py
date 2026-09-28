@@ -207,7 +207,7 @@ def readKitti360Info(args):
         # 前180度
         cam_infos.append(CameraInfo(uid=idx, R=R, T=T,
                                     timestamp=timestamp, pointcloud_camera=points_cam, intensity=intensity,
-                                    towards='forward'))
+                                    towards='forward', sensor_id=0, frame_idx=frame_idx))
 
         # 后180度
         R_back = R @ np.array([-1, 0, 0,
@@ -217,7 +217,7 @@ def readKitti360Info(args):
         points_cam_back = points @ R_back + T_back
         cam_infos.append(CameraInfo(uid=idx + frames, R=R_back, T=T_back,
                                     timestamp=timestamp, pointcloud_camera=points_cam_back, intensity=intensity,
-                                    towards='backward'))
+                                    towards='backward', sensor_id=0, frame_idx=frame_idx))
 
         if debug_cuda and frame_idx >= 15:
             break

@@ -1,5 +1,13 @@
 test_only: False
 only_velodyne: False
+
+# Logging: none | tensorboard | wandb
+logger_backend: "tensorboard"
+logger_log_interval: 10
+logger_log_images: true
+wandb_project: "gs-lidar"
+wandb_entity: null
+wandb_run_name: null
 scale_factor: 1.0
 vfov: null
 hfov: null
@@ -8,6 +16,9 @@ shuffle: True
 median_depth: False
 lambda_distortion: 0.0
 sequence_id: null  # for kitti-360
+lidar2ego: null  # 4x4 lidar-to-ego; null uses GACRT014 default in gacrt_loader
+pose_frame: null   # imu|ego|lidar; with point_frame=imu/ego forces lidar2ego=I
+point_frame: null
 intensity_lr: 0.1
 lambda_lidar_median: 0.0
 lambda_lidar_dssim: 0.0
@@ -118,3 +129,40 @@ lambda_v_reg: 0.0
 lambda_lidar: 0.1
 lidar_decay: 1.0
 lambda_v_smooth: 0.0
+
+# Hybrid static-background training (GS-LiDAR × XSIM)
+# od_mask_gt_loss: strip dynamic points from RV, fill OD silhouettes,
+# use static GT for chamfer/smooth/eval, leave OD unsupervised in raydrop.
+static_only: false
+od_mask_init: false
+od_mask_gt_loss: false
+od_bbox_scale: 1.15
+static_confidence_track: false
+od_min_displacement: 0.5
+od_min_speed: null
+
+# Multi-source fused lidar. Null = one IMU/ego panorama, all points as input.
+# source: 0=OT128 top, 1=QT128 left, 2=right, 3=front, 4=back
+input_lidar_source: null
+ego_near_radius: 2.5              # drop points near IMU/ego origin
+ego_body_aabb: null               # [[xmin,xmax],[ymin,ymax],[zmin,zmax]] in IMU/ego
+ego_body_filter_sources: null     # e.g. [1, 2, 3, 4] = strip body hits from 补盲
+# Body ignored in loss. Inference: RV-project that frame's GT AABB points, paste
+# over render, decode; re-applied after UNet refine raydrop.
+ego_body_infer_replace: true
+ego_body_replace_dilate: 2
+ego_body_cloud: null              # optional rigid npz; per-frame GT preferred
+blind_lidar_origins: false        # one QT128 camera per blind lidar, at that lidar origin
+calib_dir: null
+n_lidar_sensors: 1                # raydrop priors; 4 when blind_lidar_origins
+# Static per-sensor dead zone (blind lidars): pixels hit in < thresh of train frames,
+# connected to the RV bottom. Ignored in raydrop loss (plus a dilated edge band),
+# forced to drop at inference. Cached as {model_path}/blind_dead_mask.npz.
+# Rasterizer near plane (m): Gaussians centred / ray hits closer than this are culled.
+# 2.0 suits a roof lidar; bumper-mounted blind lidars observe mostly within 2 m.
+raster_near: 2.0
+blind_dead_mask: false
+blind_dead_thresh: 0.02
+blind_dead_col_window: 2          # ± columns; bridges the QT128 azimuth-sampling gaps
+blind_dead_bottom_connected: true # exclude open sky / far-field empties
+blind_dead_ignore_dilate: 2

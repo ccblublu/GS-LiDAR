@@ -6,6 +6,10 @@
 
 exhaust_test: false
 
+source_path: "data"
+model_path: "eval_output/gacrt_reconstruction/GACRT014_1740908194"
+
+
 # ModelParams
 scene_type: "Gacrt"
 resolution_scales: [ 1, 2, 4 ]
@@ -23,7 +27,7 @@ hw: [ 128, 900 ]
 
 
 # OptimizationParams
-iterations: 30000
+iterations: 50000
 
 densify_until_iter: 15000
 densify_grad_threshold: 1e-4
@@ -43,7 +47,7 @@ lambda_distortion: 1e-2
 lambda_normal_consistency: 1e-1
 thresh_opa_prune: 0.1
 
-test_iterations: [ 3000, 7000, 15000, 30000 ]
+test_iterations: [ 3000, 7000, 15000, 30000, 50000]
 random_init_point: 0
 dynamic: True
 sky_depth: False
@@ -59,7 +63,7 @@ num_pts: 3000000
 densify_until_num_points: 10000000
 
 # OD-enhanced dynamic optimization
-use_od_labels: false
+use_od_labels: True
 od_dynamic_labels: [0, 1, 2, 5, 7]   # car, truck, bus, pedestrian, bicycle
 lambda_v_reg_static: 1e1               # strong: push static velocity to zero
 lambda_v_reg_dynamic: 1e-3             # weak: allow dynamic objects to move freely

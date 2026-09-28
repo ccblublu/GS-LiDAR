@@ -243,7 +243,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -302,6 +303,7 @@ int CudaRasterizer::Rasterizer::forward(
 				   hfov_min,
 				   hfov_max,
 				   scale_factor,
+				   near_dist,
 				   geomState.transMat),
 			   debug)
 
@@ -376,7 +378,8 @@ int CudaRasterizer::Rasterizer::forward(
 				   vfov_max,
 				   hfov_min,
 				   hfov_max,
-				   scale_factor),
+				   scale_factor,
+				   near_dist),
 			   debug)
 
 	CHECK_CUDA(cudaMemcpy(out_T, imgState.accum_alpha, width * height * sizeof(float), cudaMemcpyDeviceToDevice), debug);
@@ -427,7 +430,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -476,7 +480,8 @@ void CudaRasterizer::Rasterizer::backward(
 				   vfov_max,
 				   hfov_min,
 				   hfov_max,
-				   scale_factor),
+				   scale_factor,
+				   near_dist),
 			   debug)
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

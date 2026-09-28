@@ -49,6 +49,7 @@ namespace FORWARD
 					const float hfov_min,
 					const float hfov_max,
 					const float scale_factor,
+					const float near_dist,
 					float *transMats);
 
 	// Main rasterization method.
@@ -73,7 +74,8 @@ namespace FORWARD
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
-		const float scale_factor);
+		const float scale_factor,
+		const float near_dist);
 }
 
 #endif

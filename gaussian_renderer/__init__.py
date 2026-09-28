@@ -52,7 +52,8 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
         debug=pipe.debug,
         vfov=viewpoint_camera.vfov,
         hfov=viewpoint_camera.hfov,
-        scale_factor=pipe.scale_factor
+        scale_factor=pipe.scale_factor,
+        near_dist=float(getattr(pipe, "raster_near", 2.0)),
     )
 
     assert raster_settings.bg.shape[0] == 4
@@ -136,7 +137,8 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
     rendered_normal = rendered_normal / (rendered_normal.norm(dim=0, keepdim=True) + 1e-8)
 
     if env_map is not None:
-        lidar_raydrop_prior_from_envmap = env_map(viewpoint_camera.towards)
+        lidar_raydrop_prior_from_envmap = env_map(
+            viewpoint_camera.towards, getattr(viewpoint_camera, "sensor_id", 0))
         rendered_raydrop = lidar_raydrop_prior_from_envmap + (1 - lidar_raydrop_prior_from_envmap) * rendered_raydrop
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -159,12 +161,73 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
     }
 
 
-def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, renderFunc, renderArgs, env_map, hw):
-    assert cam_front.towards == "forward" and cam_back.towards == "backward"
-    assert cam_front.colmap_id + args.frames == cam_back.colmap_id
+def _render_half_pkg(viewpoint, gaussians, renderFunc, renderArgs, env_map, args, EPS=1e-5):
+    """Render one half-pano; returns depth(3,H,W), intensity, raydrop, gt_depth, gt_intensity."""
+    depth_gt = viewpoint.pts_depth.cuda() if viewpoint.pts_depth is not None else viewpoint.pts_depth
+    intensity_gt = viewpoint.pts_intensity.cuda() if viewpoint.pts_intensity is not None else viewpoint.pts_intensity
+    render_pkg = renderFunc(viewpoint, gaussians, *renderArgs, env_map=env_map)
 
+    depth = render_pkg['depth']
+    alpha = render_pkg['alpha']
+    raydrop_render = render_pkg['raydrop']
+
+    depth_var = render_pkg['depth_square'] - depth ** 2
+    depth_median = render_pkg["depth_median"]
+    var_quantile = depth_var.median() * 10
+
+    depth_mix = torch.zeros_like(depth)
+    depth_mix[depth_var > var_quantile] = depth_median[depth_var > var_quantile]
+    depth_mix[depth_var <= var_quantile] = depth[depth_var <= var_quantile]
+
+    depth = torch.cat([depth_mix, depth, depth_median])
+
+    if args.sky_depth:
+        sky_depth = 900
+        depth = depth / alpha.clamp_min(EPS)
+        if args.depth_blend_mode == 0:  # harmonic mean
+            depth = 1 / (alpha / depth.clamp_min(EPS) + (1 - alpha) / sky_depth).clamp_min(EPS)
+        elif args.depth_blend_mode == 1:
+            depth = alpha * depth + (1 - alpha) * sky_depth
+
+    intensity_sh = render_pkg['intensity_sh']
+    return depth, intensity_sh, raydrop_render, depth_gt, intensity_gt
+
+
+def _force_blind_dead(args, depth, intensity, raydrop, cam_front, cam_back, hw):
+    """Static blind-lidar dead zone always drops; applied before the ego-body paste."""
+    from utils.blind_dead_mask import stitch_camera_mask, force_dead_drop
+    dead = stitch_camera_mask(cam_front, cam_back, hw, args, "blind_dead_mask", device=raydrop.device)
+    return force_dead_drop(depth, intensity, raydrop, dead)
+
+
+def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, renderFunc, renderArgs, env_map, hw):
+    """Render a range image for evaluation.
+
+    ``cam_back is None`` (cam_num=1): single 180° half at HxW with args.hfov.
+    Otherwise: classic forward+back stitch to Hx(2W) covering ±180°.
+    """
     EPS = 1e-5
     h, w = hw
+
+    if cam_back is None:
+        assert cam_front.towards in (None, "forward")
+        depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano = \
+            _render_half_pkg(cam_front, gaussians, renderFunc, renderArgs, env_map, args, EPS)
+        depth_pano, intensity_sh_pano, raydrop_pano = _force_blind_dead(
+            args, depth_pano, intensity_sh_pano, raydrop_pano, cam_front, None, [h, w])
+        if getattr(args, "ego_body_infer_replace", True):
+            from utils.ego_body_mask import composite_ego_body_pano
+            dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+            depth_pano, intensity_sh_pano, raydrop_pano = composite_ego_body_pano(
+                depth_pano, intensity_sh_pano, raydrop_pano,
+                cam_front, None, [h, w], args.vfov, args.hfov, dilate=dilate)
+        return depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano
+
+    assert cam_front.towards == "forward" and cam_back.towards == "backward"
+    n_sensors = int(getattr(args, "n_lidar_sensors", 1) or 1)
+    assert cam_back.colmap_id - cam_front.colmap_id == args.frames * n_sensors
+    assert getattr(cam_front, "sensor_id", 0) == getattr(cam_back, "sensor_id", 0)
+
     breaks = (0, w // 2, 3 * w // 2, w * 2)
 
     depth_pano = torch.zeros([3, h, w * 2]).cuda()
@@ -174,33 +237,8 @@ def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, rende
     gt_intensity_pano = torch.zeros([1, h, w * 2]).cuda()
 
     for idx, viewpoint in enumerate([cam_front, cam_back]):
-        depth_gt = viewpoint.pts_depth.cuda() if viewpoint.pts_depth is not None else viewpoint.pts_depth
-        intensity_gt = viewpoint.pts_intensity.cuda() if viewpoint.pts_intensity is not None else viewpoint.pts_intensity
-        render_pkg = renderFunc(viewpoint, gaussians, *renderArgs, env_map=env_map)
-
-        depth = render_pkg['depth']
-        alpha = render_pkg['alpha']
-        raydrop_render = render_pkg['raydrop']
-
-        depth_var = render_pkg['depth_square'] - depth ** 2
-        depth_median = render_pkg["depth_median"]
-        var_quantile = depth_var.median() * 10
-
-        depth_mix = torch.zeros_like(depth)
-        depth_mix[depth_var > var_quantile] = depth_median[depth_var > var_quantile]
-        depth_mix[depth_var <= var_quantile] = depth[depth_var <= var_quantile]
-
-        depth = torch.cat([depth_mix, depth, depth_median])
-
-        if args.sky_depth:
-            sky_depth = 900
-            depth = depth / alpha.clamp_min(EPS)
-            if args.depth_blend_mode == 0:  # harmonic mean
-                depth = 1 / (alpha / depth.clamp_min(EPS) + (1 - alpha) / sky_depth).clamp_min(EPS)
-            elif args.depth_blend_mode == 1:
-                depth = alpha * depth + (1 - alpha) * sky_depth
-
-        intensity_sh = render_pkg['intensity_sh']
+        depth, intensity_sh, raydrop_render, depth_gt, intensity_gt = _render_half_pkg(
+            viewpoint, gaussians, renderFunc, renderArgs, env_map, args, EPS)
 
         if idx % 2 == 0:  # 前180度
             depth_pano[:, :, breaks[1]:breaks[2]] = depth
@@ -227,5 +265,14 @@ def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, rende
 
             raydrop_pano[:, :, breaks[2]:breaks[3]] = raydrop_render[:, :, 0:(breaks[3] - breaks[2])]
             raydrop_pano[:, :, breaks[0]:breaks[1]] = raydrop_render[:, :, (w - breaks[1] + breaks[0]):w]
+
+    depth_pano, intensity_sh_pano, raydrop_pano = _force_blind_dead(
+        args, depth_pano, intensity_sh_pano, raydrop_pano, cam_front, cam_back, [h, w])
+    if getattr(args, "ego_body_infer_replace", True):
+        from utils.ego_body_mask import composite_ego_body_pano
+        dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+        depth_pano, intensity_sh_pano, raydrop_pano = composite_ego_body_pano(
+            depth_pano, intensity_sh_pano, raydrop_pano,
+            cam_front, cam_back, [h, w], args.vfov, args.hfov, dilate=dilate)
 
     return depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano

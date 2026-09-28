@@ -20,6 +20,19 @@ class CameraInfo(NamedTuple):
     pointcloud_camera: np.array = None
     intensity: np.array = None
     towards: str = None
+    od_loss_mask: np.array = None  # (1, H, W) float, 1=valid for loss, 0=OD masked
+    lidar_path: str = None
+    pointcloud_camera_input: np.array = None  # top-only RV points for raydrop / sensor input
+    intensity_input: np.array = None
+    sensor_id: int = 0
+    frame_idx: int = 0
+    ego_body_mask: np.array = None  # (1, H, W), 1 = body pixel (ignore in loss)
+    # Body returns in this camera frame (PCA-scaled); pasted at inference.
+    ego_body_points_cam: np.array = None
+    ego_body_intensity: np.array = None
+    # (1, H, W): static per-sensor dead zone (forced drop) and dead + edge band (raydrop ignore).
+    blind_dead_mask: np.array = None
+    blind_ignore_mask: np.array = None
 
 
 class SceneInfo(NamedTuple):

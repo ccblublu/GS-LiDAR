@@ -157,32 +157,44 @@ class DepthMeter:
 
         return outputs
 
-    def update(self, preds, truths):
+    def update(self, preds, truths, valid_mask=None):
         preds = preds / self.scale
         truths = truths / self.scale
+        if valid_mask is not None and torch.is_tensor(valid_mask):
+            valid_mask = valid_mask.detach().cpu().numpy()
         preds, truths = self.prepare_inputs(
             preds, truths
         )  # [B, N, 3] or [B, H, W, 3], range[0, 1]
 
         # simplified since max_pixel_value is 1 here.
-        depth_error = self.compute_depth_errors(truths, preds)
+        depth_error = self.compute_depth_errors(truths, preds, valid_mask=valid_mask)
 
         depth_error = list(depth_error)
         self.V.append(depth_error)
         self.N += 1
 
     def compute_depth_errors(
-            self, gt, pred, min_depth=1e-6, max_depth=80,
+            self, gt, pred, min_depth=1e-6, max_depth=80, valid_mask=None,
     ):
         pred[pred < min_depth] = min_depth
         pred[pred > max_depth] = max_depth
         gt[gt < min_depth] = min_depth
         gt[gt > max_depth] = max_depth
 
-        rmse = (gt - pred) ** 2
-        rmse = np.sqrt(rmse.mean())
-
-        medae = np.median(np.abs(gt - pred))
+        if valid_mask is not None:
+            vm = valid_mask.astype(bool)
+            if vm.shape != gt.shape:
+                vm = np.broadcast_to(vm, gt.shape)
+            if vm.any():
+                rmse = np.sqrt(((gt - pred)[vm] ** 2).mean())
+                medae = np.median(np.abs((gt - pred)[vm]))
+            else:
+                rmse = 0.0
+                medae = 0.0
+        else:
+            rmse = (gt - pred) ** 2
+            rmse = np.sqrt(rmse.mean())
+            medae = np.median(np.abs(gt - pred))
 
         if gt.shape[-2] >= 32:
             lpips_loss = self.lpips_fn(torch.from_numpy(pred).squeeze(0),
@@ -194,7 +206,10 @@ class DepthMeter:
             pred.squeeze(0), gt.squeeze(0), data_range=np.max(gt) - np.min(gt)
         )
 
-        psnr = 10 * np.log10(max_depth ** 2 / np.mean((pred - gt) ** 2))
+        if valid_mask is not None and vm.any():
+            psnr = 10 * np.log10(max_depth ** 2 / np.mean(((pred - gt)[vm]) ** 2))
+        else:
+            psnr = 10 * np.log10(max_depth ** 2 / np.mean((pred - gt) ** 2))
 
         return rmse, medae, lpips_loss, ssim, psnr
 
@@ -268,12 +283,13 @@ class SSIMMeter:
 
 
 class PointsMeter:
-    def __init__(self, scale, vfov):
+    def __init__(self, scale, vfov, hfov=None):
         self.V = []
         self.N = 0
         self.scale = scale
         self.vfov = vfov
-        self.hfov = (-180, 180)
+        # Stitched 360° default; pass args.hfov for cam_num=1 single-half RV.
+        self.hfov = tuple(hfov) if hfov is not None else (-180, 180)
         self.near = 0.2
         self.far = 80
 
@@ -378,11 +394,24 @@ class RaydropMeter:
 
         return outputs
 
-    def update(self, preds, truths):
+    def update(self, preds, truths, valid_mask=None):
         preds, truths = self.prepare_inputs(
             preds, truths
         )  # [B, N, 3] or [B, H, W, 3], range[0, 1]
+        if valid_mask is not None:
+            if torch.is_tensor(valid_mask):
+                valid_mask = valid_mask.detach().cpu().numpy()
+            vm = valid_mask.astype(bool)
+            if vm.shape != preds.shape:
+                vm = np.broadcast_to(vm, preds.shape)
+            preds = preds[vm]
+            truths = truths[vm]
         results = []
+
+        if preds.size == 0:
+            self.V.append([0.0, 1.0, 1.0])
+            self.N += 1
+            return
 
         rmse = (truths - preds) ** 2
         rmse = np.sqrt(rmse.mean())
@@ -436,32 +465,45 @@ class IntensityMeter:
 
         return outputs
 
-    def update(self, preds, truths):
+    def update(self, preds, truths, valid_mask=None):
         preds = preds / self.scale
         truths = truths / self.scale
+        if valid_mask is not None and torch.is_tensor(valid_mask):
+            valid_mask = valid_mask.detach().cpu().numpy()
         preds, truths = self.prepare_inputs(
             preds, truths
         )  # [B, N, 3] or [B, H, W, 3], range[0, 1]
 
         # simplified since max_pixel_value is 1 here.
-        intensity_error = self.compute_intensity_errors(truths, preds)
+        intensity_error = self.compute_intensity_errors(truths, preds, valid_mask=valid_mask)
 
         intensity_error = list(intensity_error)
         self.V.append(intensity_error)
         self.N += 1
 
     def compute_intensity_errors(
-            self, gt, pred, min_intensity=1e-6, max_intensity=1.0,
+            self, gt, pred, min_intensity=1e-6, max_intensity=1.0, valid_mask=None,
     ):
         pred[pred < min_intensity] = min_intensity
         pred[pred > max_intensity] = max_intensity
         gt[gt < min_intensity] = min_intensity
         gt[gt > max_intensity] = max_intensity
 
-        rmse = (gt - pred) ** 2
-        rmse = np.sqrt(rmse.mean())
-
-        medae = np.median(np.abs(gt - pred))
+        if valid_mask is not None:
+            vm = valid_mask.astype(bool)
+            if vm.shape != gt.shape:
+                vm = np.broadcast_to(vm, gt.shape)
+            if vm.any():
+                rmse = np.sqrt(((gt - pred)[vm] ** 2).mean())
+                medae = np.median(np.abs((gt - pred)[vm]))
+                psnr = 10 * np.log10(max_intensity ** 2 / np.mean(((pred - gt)[vm]) ** 2))
+            else:
+                rmse, medae, psnr = 0.0, 0.0, 0.0
+        else:
+            rmse = (gt - pred) ** 2
+            rmse = np.sqrt(rmse.mean())
+            medae = np.median(np.abs(gt - pred))
+            psnr = 10 * np.log10(max_intensity ** 2 / np.mean((pred - gt) ** 2))
 
         if gt.shape[-2] >= 32:
             lpips_loss = self.lpips_fn(torch.from_numpy(pred).squeeze(0),
@@ -472,8 +514,6 @@ class IntensityMeter:
         ssim = structural_similarity(
             pred.squeeze(0), gt.squeeze(0), data_range=np.max(gt) - np.min(gt)
         )
-
-        psnr = 10 * np.log10(max_intensity ** 2 / np.mean((pred - gt) ** 2))
 
         return rmse, medae, lpips_loss, ssim, psnr
 

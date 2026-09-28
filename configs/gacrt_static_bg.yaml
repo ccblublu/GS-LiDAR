@@ -1,0 +1,70 @@
+# Static background training for GS-LiDAR × XSIM hybrid pipeline.
+# Trains GS-LiDAR on static scene only; dynamic OD regions masked in init + loss.
+
+exhaust_test: false
+
+source_path: "data"
+model_path: "eval_output/hybrid/GACRT014_static_bg"
+
+scene_type: "Gacrt"
+sequence_id: "GACRT014_1740908194"
+pkl_path: "data/GACRT014_1740908194.pkl"
+keyframes_only: false
+
+resolution_scales: [1, 2, 4]
+scale_increase_interval: 5000
+cam_num: 2
+eval: True
+separate_scaling_t: 0.2
+
+vfov: [-25.0, 15.0]
+hfov: [-90, 90]
+hw: [128, 900]
+
+iterations: 50000
+densify_until_iter: 15000
+densify_grad_threshold: 1e-4
+sh_increase_interval: 2000
+
+lambda_lidar: 1e1
+lambda_lidar_median: 1e1
+lidar_decay: 0
+only_velodyne: True
+lambda_intensity: 0.05
+lambda_intensity_sh: 0.05
+lambda_raydrop: 0.05
+lambda_smooth: 1e-3
+lambda_chamfer: 1e-1
+lambda_distortion: 1e-2
+lambda_normal_consistency: 1e-1
+thresh_opa_prune: 0.1
+
+test_iterations: [3000, 7000, 15000, 30000, 50000]
+random_init_point: 0
+dynamic: false
+sky_depth: false
+
+opacity_lr: 0.05
+velocity_lr: 0.001
+lambda_self_supervision: 0.0
+lambda_v_reg: 1e0
+lambda_v_reg_static: 1e1
+lambda_v_reg_dynamic: 1e-3
+t_init: 0.006
+
+num_pts: 3000000
+densify_until_num_points: 10000000
+
+# Hybrid static-background options
+# od_mask_gt_loss also: strips dynamic points from RV, fills OD silhouettes,
+# uses static GT for chamfer/smooth/eval, and leaves OD pixels unsupervised in raydrop.
+static_only: true
+od_mask_init: true
+od_mask_gt_loss: true
+od_bbox_scale: 1.15
+static_confidence_track: true
+
+use_od_labels: true
+od_dynamic_labels: [0, 1, 2, 5, 7]
+od_velocity_init: false
+od_min_speed: 2.0

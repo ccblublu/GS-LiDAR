@@ -101,7 +101,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.vfov[1],
             raster_settings.hfov[0],
             raster_settings.hfov[1],
-            raster_settings.scale_factor
+            raster_settings.scale_factor,
+            raster_settings.near_dist
         )
 
         # Invoke C++/CUDA rasterizer
@@ -160,7 +161,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.vfov[1],
                 raster_settings.hfov[0],
                 raster_settings.hfov[1],
-                raster_settings.scale_factor)
+                raster_settings.scale_factor,
+                raster_settings.near_dist)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -207,6 +209,7 @@ class GaussianRasterizationSettings(NamedTuple):
     vfov: tuple
     hfov: tuple
     scale_factor: float
+    near_dist: float = 2.0  # metres; Gaussians / intersections closer to the sensor are culled
 
 
 class GaussianRasterizer(nn.Module):

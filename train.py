@@ -27,10 +27,103 @@ import numpy as np
 from omegaconf import OmegaConf
 from utils.graphics_utils import depth_to_normal
 from utils.metrics_utils import DepthMeter, PointsMeter, RaydropMeter, IntensityMeter
+from utils.training_logger import TrainingLogger
+from utils.static_confidence import StaticConfidenceTracker
+from utils.od_loss_mask import resize_od_mask, stitch_od_mask_pano
+from utils.blind_dead_mask import dead_mask_enabled, get_camera_mask, stitch_camera_mask, force_dead_drop
 from chamfer.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 from scene.unet import UNet
 
 EPS = 1e-5
+
+
+def get_od_valid_mask(viewpoint_cam, ref_map, args):
+    """True outside OD silhouette (supervised); False inside OD (unsupervised)."""
+    if not getattr(args, 'od_mask_gt_loss', False):
+        return torch.ones_like(ref_map, dtype=torch.bool)
+    od_mask = getattr(viewpoint_cam, 'od_loss_mask', None)
+    if od_mask is None:
+        return torch.ones_like(ref_map, dtype=torch.bool)
+    od_mask = resize_od_mask(od_mask, ref_map.shape[-2], ref_map.shape[-1]).to(ref_map.device)
+    return od_mask > 0.5
+
+
+def get_supervision_mask(viewpoint_cam, pts_depth, args):
+    """Valid pixels for depth/intensity loss (excludes OD regions when od_mask_gt_loss)."""
+    mask = pts_depth > 0
+    if getattr(args, 'od_mask_gt_loss', False):
+        mask = mask & get_od_valid_mask(viewpoint_cam, pts_depth, args)
+    return mask
+
+
+def get_raydrop_gt(viewpoint_cam):
+    """Raydrop GT from the training-input sensor (top-only when pts_depth_input exists)."""
+    depth_in = getattr(viewpoint_cam, "pts_depth_input", None)
+    if depth_in is None:
+        depth_in = viewpoint_cam.pts_depth
+    return 1.0 - (depth_in.cuda() > 0).float()
+
+
+def get_raydrop_valid_mask(viewpoint_cam, ref_map, args):
+    """Pixels that participate in raydrop loss. Body hits and the blind dead zone are ignore."""
+    valid = get_od_valid_mask(viewpoint_cam, ref_map, args)
+    ego = getattr(viewpoint_cam, "ego_body_mask", None)
+    if ego is not None:
+        ego = resize_od_mask(ego, ref_map.shape[-2], ref_map.shape[-1]).to(ref_map.device)
+        valid = valid & (ego <= 0.5)
+    dead_ignore = get_camera_mask(
+        viewpoint_cam, ref_map.shape[-2], ref_map.shape[-1], args, "blind_ignore_mask")
+    if dead_ignore is not None:
+        valid = valid & (dead_ignore.to(ref_map.device) <= 0.5)
+    return valid
+
+
+def stitch_camera_depth(cam_front, cam_back, hw, attr="pts_depth"):
+    """Camera depth attr: HxW if ``cam_back is None``, else forward/back stitch Hx(2W)."""
+    h, w = hw
+    front = getattr(cam_front, attr, None)
+    if cam_back is None:
+        if front is None:
+            return None
+        front = front.cuda()
+        if front.shape[-2:] != (h, w):
+            front = F.interpolate(front.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+        return front
+    breaks = (0, w // 2, 3 * w // 2, w * 2)
+    back = getattr(cam_back, attr, None)
+    if front is None or back is None:
+        return None
+    front = front.cuda()
+    back = back.cuda()
+    if front.shape[-2:] != (h, w):
+        front = F.interpolate(front.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+        back = F.interpolate(back.unsqueeze(0), size=(h, w), mode="nearest").squeeze(0)
+    out = torch.zeros([1, h, w * 2], device=front.device)
+    out[:, :, breaks[1]:breaks[2]] = front
+    out[:, :, breaks[2]:breaks[3]] = back[:, :, 0:(breaks[3] - breaks[2])]
+    out[:, :, breaks[0]:breaks[1]] = back[:, :, (w - breaks[1] + breaks[0]):w]
+    return out
+
+
+def compute_hole_stats(pred_depth, gt_depth, od_valid=None):
+    """Static-miss / pred-empty / OD-empty rates for one pano."""
+    pred_hit = pred_depth > 0
+    gt_hit = gt_depth > 0
+    static_miss = (gt_hit & ~pred_hit).float().sum() / gt_hit.float().sum().clamp_min(1)
+    pred_empty = (~pred_hit).float().mean()
+    stats = {
+        "static_miss": float(static_miss.item()),
+        "pred_empty": float(pred_empty.item()),
+    }
+    if od_valid is not None:
+        od_region = ~od_valid
+        od_empty = (od_region & ~pred_hit).float().sum() / od_region.float().sum().clamp_min(1)
+        stats["od_empty"] = float(od_empty.item())
+        stats["od_frac"] = float(od_region.float().mean().item())
+    return stats
+
+
+# training_logger = None
 
 
 def training(args):
@@ -46,7 +139,8 @@ def training(args):
     gaussians.training_setup(args)
 
     start_w, start_h = scene.getWH()
-    lidar_raydrop_prior = RayDropPrior(h=start_h, w=start_w).cuda()
+    n_sensors = int(getattr(args, "n_lidar_sensors", 1) or 1)
+    lidar_raydrop_prior = RayDropPrior(h=start_h, w=start_w, n_sensors=n_sensors).cuda()
     lidar_raydrop_prior.training_setup(args)
 
     first_iter = 0
@@ -57,7 +151,7 @@ def training(args):
         lidar_raydrop_prior_checkpoint = os.path.join(os.path.dirname(args.start_checkpoint),
                                                       os.path.basename(args.start_checkpoint).replace("chkpnt", "lidar_raydrop_prior_chkpnt"))
         (lidar_raydrop_prior_params, _) = torch.load(lidar_raydrop_prior_checkpoint)
-        lidar_raydrop_prior.restore(lidar_raydrop_prior_params)
+        lidar_raydrop_prior.restore(lidar_raydrop_prior_params, args)
 
         for i in range(first_iter // args.scale_increase_interval):
             scene.upScale()
@@ -75,6 +169,15 @@ def training(args):
     iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
+
+    conf_trackers = {}
+    if getattr(args, 'static_confidence_track', False):
+        for res_scale in scene.resolution_scales:
+            w, h = scene.wh[res_scale]
+            conf_trackers[res_scale] = {
+                'forward': StaticConfidenceTracker(h, w),
+                'backward': StaticConfidenceTracker(h, w),
+            }
 
     ema_dict_for_log = defaultdict(int)
     progress_bar = tqdm(range(first_iter + 1, args.iterations + 1), desc="Training progress", miniters=10)
@@ -137,7 +240,7 @@ def training(args):
         if args.lambda_lidar > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
 
-            mask = pts_depth > 0
+            mask = get_supervision_mask(viewpoint_cam, pts_depth, args)
             loss_lidar = F.l1_loss(pts_depth[mask], depth[mask])
             if args.lidar_decay > 0:
                 iter_decay = np.exp(-iteration / 8000 * args.lidar_decay)
@@ -149,7 +252,7 @@ def training(args):
         if args.lambda_lidar_median > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
 
-            mask = pts_depth > 0
+            mask = get_supervision_mask(viewpoint_cam, pts_depth, args)
             loss_lidar_median = F.l1_loss(pts_depth[mask], depth_median[mask])
             log_dict['loss_lidar_median'] = loss_lidar_median.item()
             loss += args.lambda_lidar_median * loss_lidar_median
@@ -196,7 +299,7 @@ def training(args):
         # Intensity sh
         if args.lambda_intensity_sh > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
-            mask = pts_depth > 0
+            mask = get_supervision_mask(viewpoint_cam, pts_depth, args)
             pts_intensity = viewpoint_cam.pts_intensity.cuda()
             loss_intensity_sh = torch.nn.functional.l1_loss(pts_intensity[mask], intensity_sh_map[mask])
             log_dict['loss_intensity_sh'] = loss_intensity_sh.item()
@@ -204,33 +307,46 @@ def training(args):
 
         if args.lambda_raydrop > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
-            gt_raydrop = 1.0 - (pts_depth > 0).float()
-            loss_raydrop = torch.nn.functional.binary_cross_entropy(raydrop_map, gt_raydrop)
+            # Hits = training-input returns (top-only when pts_depth_input is set).
+            # OD silhouette and ego-body pixels are unsupervised, not "must drop".
+            gt_raydrop = get_raydrop_gt(viewpoint_cam)
+            raydrop_valid = get_raydrop_valid_mask(viewpoint_cam, pts_depth, args)
+            if raydrop_valid.any():
+                loss_raydrop = F.binary_cross_entropy(raydrop_map[raydrop_valid], gt_raydrop[raydrop_valid])
+            else:
+                loss_raydrop = torch.zeros((), device=raydrop_map.device)
             log_dict['loss_raydrop'] = loss_raydrop.item()
             loss += args.lambda_raydrop * loss_raydrop
 
         # chamfer loss
         if args.lambda_chamfer > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
-            mask = (pts_depth > 0).float()
+            mask = get_supervision_mask(viewpoint_cam, pts_depth, args).float()
 
             cham_fn = chamfer_3DDist()
             pred_lidar = pano_to_lidar(depth * mask, args.vfov, args.hfov) / args.scale_factor
-            gt_lidar = pano_to_lidar(pts_depth, args.vfov, args.hfov) / args.scale_factor
-            dist1, dist2, _, _ = cham_fn(pred_lidar[None], gt_lidar[None])
-
-            loss_chamfer = dist1.mean() + dist2.mean()
+            gt_lidar = pano_to_lidar(pts_depth * mask, args.vfov, args.hfov) / args.scale_factor
+            if pred_lidar.numel() == 0 or gt_lidar.numel() == 0:
+                loss_chamfer = torch.tensor(0.0, device=depth.device)
+            else:
+                dist1, dist2, _, _ = cham_fn(pred_lidar[None], gt_lidar[None])
+                loss_chamfer = dist1.mean() + dist2.mean()
             log_dict['loss_chamfer'] = loss_chamfer.item()
             loss += args.lambda_chamfer * loss_chamfer
 
         if args.lambda_smooth > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
+            od_valid = get_od_valid_mask(viewpoint_cam, pts_depth, args).float()
             gt_grad_x = pts_depth[:, :, :-1] - pts_depth[:, :, 1:]
             gt_grad_y = pts_depth[:, :-1, :] - pts_depth[:, 1:, :]
             mask_x = (torch.where(pts_depth[:, :, :-1] > 0, 1, 0) *
-                      torch.where(pts_depth[:, :, 1:] > 0, 1, 0))
+                      torch.where(pts_depth[:, :, 1:] > 0, 1, 0) *
+                      torch.where(od_valid[:, :, :-1] > 0.5, 1, 0) *
+                      torch.where(od_valid[:, :, 1:] > 0.5, 1, 0))
             mask_y = (torch.where(pts_depth[:, :-1, :] > 0, 1, 0) *
-                      torch.where(pts_depth[:, 1:, :] > 0, 1, 0))
+                      torch.where(pts_depth[:, 1:, :] > 0, 1, 0) *
+                      torch.where(od_valid[:, :-1, :] > 0.5, 1, 0) *
+                      torch.where(od_valid[:, 1:, :] > 0.5, 1, 0))
 
             grad_clip = 0.01 * args.scale_factor
             grad_mask_x = torch.where(torch.abs(gt_grad_x) < grad_clip, 1, 0) * mask_x
@@ -240,8 +356,14 @@ def training(args):
 
             pred_grad_x = depth[:, :, :-1] - depth[:, :, 1:]
             pred_grad_y = depth[:, :-1, :] - depth[:, 1:, :]
-            loss_smooth = (F.l1_loss(pred_grad_x[grad_mask_x], gt_grad_x[grad_mask_x])
-                           + F.l1_loss(pred_grad_y[grad_mask_y], gt_grad_y[grad_mask_y]))
+            if grad_mask_x.any() or grad_mask_y.any():
+                loss_smooth = torch.tensor(0.0, device=depth.device)
+                if grad_mask_x.any():
+                    loss_smooth = loss_smooth + F.l1_loss(pred_grad_x[grad_mask_x], gt_grad_x[grad_mask_x])
+                if grad_mask_y.any():
+                    loss_smooth = loss_smooth + F.l1_loss(pred_grad_y[grad_mask_y], gt_grad_y[grad_mask_y])
+            else:
+                loss_smooth = torch.tensor(0.0, device=depth.device)
             log_dict['loss_smooth'] = loss_smooth.item()
             loss += args.lambda_smooth * loss_smooth
 
@@ -285,6 +407,22 @@ def training(args):
         iter_end.record()
 
         with torch.no_grad():
+            if conf_trackers:
+                scale = scene.resolution_scales[scene.scale_index]
+                towards = viewpoint_cam.towards or 'forward'
+                if scale in conf_trackers and towards in conf_trackers[scale]:
+                    pts_depth_conf = viewpoint_cam.pts_depth.cuda()
+                    od_mask_conf = getattr(viewpoint_cam, 'od_loss_mask', None)
+                    if od_mask_conf is not None:
+                        od_mask_conf = od_mask_conf.cuda()
+                        if od_mask_conf.shape[-2:] != pts_depth_conf.shape[-2:]:
+                            od_mask_conf = F.interpolate(
+                                od_mask_conf.unsqueeze(0),
+                                size=pts_depth_conf.shape[-2:],
+                                mode='nearest',
+                            ).squeeze(0)
+                    conf_trackers[scale][towards].update(pts_depth_conf, od_mask_conf)
+
             for key in (['loss', "loss_l1", "psnr"] if not args.only_velodyne else ['loss']):
                 ema_dict_for_log[key] = 0.4 * log_dict[key] + 0.6 * ema_dict_for_log[key]
 
@@ -296,7 +434,15 @@ def training(args):
 
             log_dict['iter_time'] = iter_start.elapsed_time(iter_end)
             log_dict['total_points'] = gaussians.get_xyz.shape[0]
-            # Log and save
+            if training_logger is not None:
+                training_logger.log_train_step(iteration, log_dict)
+
+            # Save before eval so an OOM in complete_eval/refine does not lose this iter.
+            if iteration in args.checkpoint_iterations:
+                print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/ckpt/chkpnt" + str(iteration) + ".pth")
+                torch.save((lidar_raydrop_prior.capture(), iteration), scene.model_path + "/ckpt/lidar_raydrop_prior_chkpnt" + str(iteration) + ".pth")
+
             complete_eval(iteration, args.test_iterations, scene, render, (args, background),
                           log_dict, env_map=lidar_raydrop_prior)
 
@@ -347,7 +493,7 @@ def training(args):
                     raydrop_map = visualize_depth(raydrop_map, near=0.01, far=1)
                     other_img.append(raydrop_map)
 
-                    gt_raydrop = 1.0 - (viewpoint_cam.pts_depth.cuda() > 0).float()
+                    gt_raydrop = get_raydrop_gt(viewpoint_cam)
                     gt_raydrop = visualize_depth(gt_raydrop, near=0.01, far=1)
                     other_img.append(gt_raydrop)
 
@@ -383,16 +529,20 @@ def training(args):
                                   ] + other_img, nrow=4)
 
                 save_image(grid, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
+                if training_logger is not None and getattr(args, "logger_log_images", True):
+                    training_logger.log_image("train/vis", grid, iteration)
 
             if iteration % args.scale_increase_interval == 0:
                 scene.upScale()
                 next_w, next_h = scene.getWH()
                 lidar_raydrop_prior.upscale(next_h, next_w)
 
-            if iteration in args.checkpoint_iterations:
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/ckpt/chkpnt" + str(iteration) + ".pth")
-                torch.save((lidar_raydrop_prior.capture(), iteration), scene.model_path + "/ckpt/lidar_raydrop_prior_chkpnt" + str(iteration) + ".pth")
+    if conf_trackers:
+        conf_out = {}
+        for scale, trackers in conf_trackers.items():
+            conf_out[f'forward_{scale}'] = trackers['forward'].counts
+            conf_out[f'backward_{scale}'] = trackers['backward'].counts
+        np.savez(os.path.join(args.model_path, 'static_confidence.npz'), **conf_out)
 
     return
 
@@ -416,13 +566,16 @@ def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderAr
         h //= scale
         w //= scale
 
+        half_only = int(getattr(args, "cam_num", 2) or 2) == 1
+        pm_hfov = tuple(args.hfov) if half_only else None
+
         metrics = [
             RaydropMeter(),
             IntensityMeter(scale=1),  # for intensity sh
             DepthMeter(scale=args.scale_factor),
-            PointsMeter(scale=args.scale_factor, vfov=args.vfov),
-            PointsMeter(scale=args.scale_factor, vfov=args.vfov),
-            PointsMeter(scale=args.scale_factor, vfov=args.vfov)
+            PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=pm_hfov),
+            PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=pm_hfov),
+            PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=pm_hfov),
         ]
 
         for config in validation_configs:
@@ -433,23 +586,77 @@ def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderAr
                 outdir = os.path.join(args.model_path, "eval", config['name'] + f"_{iteration}" + "_render")
                 os.makedirs(outdir, exist_ok=True)
 
-                for idx in range(len(config['cameras']) // 2):
-                    cam_front = config['cameras'][idx * 2]
-                    cam_back = config['cameras'][idx * 2 + 1]
+                hole_stats = []
+                n_cams = len(config['cameras'])
+                n_items = n_cams if half_only else n_cams // 2
+                for idx in range(n_items):
+                    if half_only:
+                        cam_front = config['cameras'][idx]
+                        cam_back = None
+                    else:
+                        cam_front = config['cameras'][idx * 2]
+                        cam_back = config['cameras'][idx * 2 + 1]
 
                     depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano \
                         = render_range_map(args, cam_front, cam_back, scene.gaussians, renderFunc, renderArgs, env_map, [h, w])
 
                     raydrop_pano_mask = torch.where(raydrop_pano > 0.5, 1, 0)
-                    gt_raydrop_pano = torch.where(gt_depth_pano > 0, 0, 1)
+                    gt_input_pano = stitch_camera_depth(cam_front, cam_back, [h, w], "pts_depth_input")
+                    if gt_input_pano is not None:
+                        gt_raydrop_pano = torch.where(gt_input_pano > 0, 0, 1)
+                    else:
+                        gt_raydrop_pano = torch.where(gt_depth_pano > 0, 0, 1)
+                    od_valid_pano = None
+                    if getattr(args, 'od_mask_gt_loss', False):
+                        od_valid_pano = stitch_od_mask_pano(cam_front, cam_back, [h, w]) > 0.5
+                    ego_body_pano = stitch_camera_depth(cam_front, cam_back, [h, w], "ego_body_mask")
+                    raydrop_valid = od_valid_pano
+                    if ego_body_pano is not None:
+                        ego_ok = ego_body_pano <= 0.5
+                        raydrop_valid = ego_ok if raydrop_valid is None else (raydrop_valid & ego_ok)
+                    dead_pano = stitch_camera_mask(cam_front, cam_back, [h, w], args, "blind_dead_mask")
+                    dead_ignore_pano = stitch_camera_mask(cam_front, cam_back, [h, w], args, "blind_ignore_mask")
+                    if dead_ignore_pano is not None:
+                        dead_ok = dead_ignore_pano <= 0.5
+                        raydrop_valid = dead_ok if raydrop_valid is None else (raydrop_valid & dead_ok)
 
                     if iteration == args.iterations:
                         savedir = os.path.join(args.model_path, "ray_drop_datasets")
                         torch.save(torch.cat([raydrop_pano, intensity_sh_pano, depth_pano[[0]]]), os.path.join(savedir, f"render_{config['name']}", f"{cam_front.colmap_id:03d}.pt"))
-                        torch.save(torch.cat([gt_raydrop_pano, gt_intensity_pano, gt_depth_pano]), os.path.join(savedir, f"gt", f"{cam_front.colmap_id:03d}.pt"))
+                        gt_pack = [gt_raydrop_pano, gt_intensity_pano, gt_depth_pano]
+                        if od_valid_pano is not None:
+                            gt_pack.append(od_valid_pano.float())
+                        torch.save(torch.cat(gt_pack), os.path.join(savedir, f"gt", f"{cam_front.colmap_id:03d}.pt"))
+                        # GT AABB body RV for re-paste after UNet refine.
+                        if getattr(args, "ego_body_infer_replace", True):
+                            from utils.ego_body_mask import build_gt_ego_body_rv
+                            dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+                            body_d, body_i, body_clear = build_gt_ego_body_rv(
+                                cam_front, cam_back, [h, w], args.vfov, args.hfov,
+                                dilate=dilate, device="cpu")
+                            if body_d is not None:
+                                ego_dir = os.path.join(savedir, "ego_body")
+                                os.makedirs(ego_dir, exist_ok=True)
+                                torch.save(
+                                    torch.cat([body_d.cpu(), body_i.cpu(), body_clear.cpu()]),
+                                    os.path.join(ego_dir, f"{cam_front.colmap_id:03d}.pt"))
+                        # [dead, ignore]: refine ignores both in BCE and forces dead to drop.
+                        if dead_pano is not None and dead_ignore_pano is not None:
+                            dead_dir = os.path.join(savedir, "blind_dead")
+                            os.makedirs(dead_dir, exist_ok=True)
+                            torch.save(
+                                torch.cat([dead_pano.cpu(), dead_ignore_pano.cpu()]),
+                                os.path.join(dead_dir, f"{cam_front.colmap_id:03d}.pt"))
 
                     depth_pano = depth_pano * (1.0 - raydrop_pano_mask)
                     intensity_sh_pano = intensity_sh_pano * (1.0 - raydrop_pano_mask)
+                    if od_valid_pano is not None:
+                        depth_eval = depth_pano * od_valid_pano.float()
+                        intensity_eval = intensity_sh_pano * od_valid_pano.float()
+                    else:
+                        depth_eval = depth_pano
+                        intensity_eval = intensity_sh_pano
+                    hole_stats.append(compute_hole_stats(depth_eval[[0]], gt_depth_pano, od_valid_pano))
 
                     grid = [visualize_depth(depth_pano[[0]], scale_factor=args.scale_factor),
                             intensity_sh_pano.clamp(0.0, 1.0).repeat(3, 1, 1),
@@ -462,15 +669,18 @@ def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderAr
                     grid = make_grid(grid, nrow=2)
                     save_image(grid, os.path.join(outdir, f"{cam_front.colmap_id:03d}.png"))
 
+                    static_valid = (gt_depth_pano > 0)
+                    if od_valid_pano is not None:
+                        static_valid = static_valid & od_valid_pano
                     for i, metric in enumerate(metrics):
                         if i == 0:  # hard code
-                            metric.update(raydrop_pano, gt_raydrop_pano)
+                            metric.update(raydrop_pano, gt_raydrop_pano, valid_mask=raydrop_valid)
                         elif i == 1:
-                            metric.update(intensity_sh_pano, gt_intensity_pano)
+                            metric.update(intensity_eval, gt_intensity_pano, valid_mask=static_valid)
                         elif i == 2:
-                            metric.update(depth_pano[[0]], gt_depth_pano)
+                            metric.update(depth_eval[[0]], gt_depth_pano, valid_mask=static_valid)
                         else:
-                            metric.update(depth_pano[[i - 3]], gt_depth_pano)
+                            metric.update(depth_eval[[i - 3]], gt_depth_pano)
 
                 # Ray drop
                 RMSE, Acc, F1 = metrics[0].measure()
@@ -482,24 +692,42 @@ def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderAr
                 C_D_mean, F_score_mean = metrics[4].measure().astype(float)
                 C_D_median, F_score_median = metrics[5].measure().astype(float)
 
+                hole_payload = {}
+                if hole_stats:
+                    keys = hole_stats[0].keys()
+                    hole_payload = {k: float(np.mean([s[k] for s in hole_stats])) for k in keys}
+
                 with open(os.path.join(outdir, "metrics.json"), "w") as f:
-                    json.dump({"split": config['name'], "iteration": iteration,
+                    metrics_payload = {"split": config['name'], "iteration": iteration,
                                "Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
                                "Point Cloud mix": {"C-D": C_D_mix, "F-score": F_score_mix},
                                "Point Cloud mean": {"C-D": C_D_mean, "F-score": F_score_mean},
                                "Point Cloud median": {"C-D": C_D_median, "F-score": F_score_median},
                                "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_loss_d, "SSIM": ssim_d, "PSNR": psnr_d},
                                "Intensity SH": {"RMSE": rmse_i_sh, "MedAE": medae_i_sh, "LPIPS": lpips_loss_i_sh, "SSIM": ssim_i_sh, "PSNR": psnr_i_sh},
-                               }, f, indent=1)
+                               }
+                    if hole_payload:
+                        metrics_payload["Holes"] = hole_payload
+                    json.dump(metrics_payload, f, indent=1)
+
+                if training_logger is not None:
+                    training_logger.log_eval_metrics(iteration, config['name'], {
+                        "Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
+                        "Point Cloud mix": {"C-D": C_D_mix, "F-score": F_score_mix},
+                        "Point Cloud mean": {"C-D": C_D_mean, "F-score": F_score_mean},
+                        "Point Cloud median": {"C-D": C_D_median, "F-score": F_score_median},
+                        "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_loss_d, "SSIM": ssim_d, "PSNR": psnr_d},
+                        "Intensity SH": {"RMSE": rmse_i_sh, "MedAE": medae_i_sh, "LPIPS": lpips_loss_i_sh, "SSIM": ssim_i_sh, "PSNR": psnr_i_sh},
+                    })
 
         torch.cuda.empty_cache()
 
 
 def refine():
     refine_output_dir = os.path.join(args.model_path, "refine")
-    if os.path.exists(refine_output_dir):
-        shutil.rmtree(refine_output_dir)
-    os.makedirs(refine_output_dir)
+    # if os.path.exists(refine_output_dir):
+        # shutil.rmtree(refine_output_dir)
+    os.makedirs(refine_output_dir, exist_ok=True)
     gt_dir = os.path.join(args.model_path, "ray_drop_datasets", "gt")
     train_dir = os.path.join(args.model_path, "ray_drop_datasets", f"render_train")
 
@@ -509,39 +737,66 @@ def refine():
 
     raydrop_input_list = []
     raydrop_gt_list = []
+    raydrop_valid_list = []
+
+    train_names = [n for n in os.listdir(train_dir) if n.endswith(".pt")]
+    if not train_names:
+        print(f"Skip refine: no raydrop train tensors in {train_dir}. "
+              "Need a last-iteration eval to write ray_drop_datasets.")
+        return
+
+    dead_dir = os.path.join(args.model_path, "ray_drop_datasets", "blind_dead")
+    use_dead = dead_mask_enabled(args)
 
     print("Preparing for Raydrop Refinemet ...")
-    for data in tqdm(os.listdir(train_dir)):
+    for data in tqdm(train_names):
         raydrop_input = torch.load(os.path.join(train_dir, data)).unsqueeze(0)
         raydrop_input_list.append(raydrop_input)
-        gt_raydrop = torch.load(os.path.join(gt_dir, data))[[0]].unsqueeze(0)
+        gt_pack = torch.load(os.path.join(gt_dir, data))
+        gt_raydrop = gt_pack[[0]].unsqueeze(0)
         raydrop_gt_list.append(gt_raydrop)
+        if gt_pack.shape[0] > 3:
+            valid = gt_pack[[3]].unsqueeze(0)
+        else:
+            valid = torch.ones_like(gt_raydrop)
+        dead_path = os.path.join(dead_dir, data)
+        if use_dead and os.path.isfile(dead_path):
+            valid = valid * (1.0 - torch.load(dead_path, map_location=valid.device)[[1]].unsqueeze(0))
+        raydrop_valid_list.append(valid)
 
     torch.cuda.empty_cache()
 
-    raydrop_input = torch.cat(raydrop_input_list, dim=0).cuda().float().contiguous()  # [B, 3, H, W]
-    raydrop_gt = torch.cat(raydrop_gt_list, dim=0).cuda().float().contiguous()  # [B, 1, H, W]
+    # Keep the full stack on CPU. Multi-sensor QT128 can exceed 1700 pans;
+    # moving only the batch to GPU avoids OOM during refine().
+    raydrop_input = torch.cat(raydrop_input_list, dim=0).float().contiguous()  # [B, 3, H, W]
+    raydrop_gt = torch.cat(raydrop_gt_list, dim=0).float().contiguous()  # [B, 1, H, W]
+    raydrop_valid = torch.cat(raydrop_valid_list, dim=0).float().contiguous()  # [B, 1, H, W]
+    del raydrop_input_list, raydrop_gt_list, raydrop_valid_list
+    print(f"Refine stack on CPU: input={tuple(raydrop_input.shape)} "
+          f"({raydrop_input.nbytes / 1e9:.2f} GB) + gt/valid")
 
     loss_total = []
 
-    refine_bs = None  # set smaller batch size (e.g. 32) if OOM and adjust epochs accordingly
-    refine_epoch = 1000
+    refine_bs = 32  # set smaller batch size (e.g. 32) if OOM and adjust epochs accordingly
+    refine_all_steps = 5000
 
     optimizer = torch.optim.Adam(unet.parameters(), lr=0.001, weight_decay=0)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps=refine_epoch)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps=refine_all_steps)
     bce_fn = torch.nn.BCELoss()
 
     print("Start UNet Optimization ...")
-    for i in range(refine_epoch):
+    for i in range(refine_all_steps):
         optimizer.zero_grad()
 
         if refine_bs is not None:
             idx = np.random.choice(raydrop_input.shape[0], refine_bs, replace=False)
-            input = raydrop_input[idx, ...]
-            gt = raydrop_gt[idx, ...]
+            input = raydrop_input[idx, ...].cuda(non_blocking=True)
+            gt = raydrop_gt[idx, ...].cuda(non_blocking=True)
+            valid = raydrop_valid[idx, ...].cuda(non_blocking=True)
         else:
-            input = raydrop_input
-            gt = raydrop_gt
+            input = raydrop_input.cuda()
+            gt = raydrop_gt.cuda()
+            valid = raydrop_valid.cuda()
 
         # random mask
         mask = torch.ones_like(input).to(input.device)
@@ -556,7 +811,11 @@ def refine():
             mask[:, :, yi:yi + box_size_y, xi:xi + box_size_x] = 0.
 
         raydrop_refine = unet(input * mask)
-        bce_loss = bce_fn(raydrop_refine, gt)
+        if valid.min() < 1:
+            bce_map = torch.nn.functional.binary_cross_entropy(raydrop_refine, gt, reduction='none')
+            bce_loss = (bce_map * valid).sum() / valid.sum().clamp_min(1)
+        else:
+            bce_loss = bce_fn(raydrop_refine, gt)
         loss = bce_loss
 
         loss.backward()
@@ -574,6 +833,12 @@ def refine():
             save_image(grid, os.path.join(refine_output_dir, f"{i:04d}.png"))
             log_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             print(f"[{log_time}] iter:{i}, lr:{optimizer.param_groups[0]['lr']:.6f}, raydrop loss:{loss.item()}")
+            if training_logger is not None:
+                training_logger.log_scalars(
+                    {"loss": loss.item(), "lr": optimizer.param_groups[0]['lr']},
+                    i,
+                    prefix="refine",
+                )
 
         optimizer.step()
         scheduler.step()
@@ -585,11 +850,23 @@ def refine():
 
 
 def refine_test():
+    refine_test_bs = 32  # reduce if OOM
+
+    torch.cuda.empty_cache()
+
     file_path = f"{args.model_path}/ckpt/refine.pth"
+    if not os.path.exists(file_path):
+        print(f"Skip refine_test: {file_path} not found.")
+        return
     unet = UNet(in_channels=3, out_channels=1)
-    unet.load_state_dict(torch.load(file_path))
+    unet.load_state_dict(torch.load(file_path, map_location="cpu"))
     unet.cuda()
     unet.eval()
+
+    # cam_num=1 saves HxW half pans with args.hfov; cam_num=2 saves stitched Hx(2W) ±180°.
+    half_only = int(getattr(args, "cam_num", 2) or 2) == 1
+    hfov = tuple(args.hfov) if half_only else (-180, 180)
+    pm_hfov = tuple(args.hfov) if half_only else None
 
     for mode in ["train", "test"]:
         outdir = os.path.join(args.model_path, "eval", f"{mode}_refine_render")
@@ -597,73 +874,139 @@ def refine_test():
 
         test_dir = os.path.join(args.model_path, "ray_drop_datasets", f"render_{mode}")
         gt_dir = os.path.join(args.model_path, "ray_drop_datasets", "gt")
-
-        test_input_list = []
-        gt_list = []
-        name_list = []
-        print(f"Preparing for Refinemet {mode} ...")
-        for data in tqdm(os.listdir(test_dir)):
-            raydrop_input = torch.load(os.path.join(test_dir, data)).unsqueeze(0)
-            test_input_list.append(raydrop_input)
-            gt_raydrop = torch.load(os.path.join(gt_dir, data)).unsqueeze(0)
-            gt_list.append(gt_raydrop)
-            name_list.append(data)
-
-        test_input = torch.cat(test_input_list, dim=0).cuda().float().contiguous()  # [B, 3, H, W]
-        gt = torch.cat(gt_list, dim=0).cuda().float().contiguous()  # [B, 3, H, W]
+        name_list = sorted(os.listdir(test_dir))
 
         metrics = [
             RaydropMeter(),
             IntensityMeter(scale=1),
             DepthMeter(scale=args.scale_factor),
-            PointsMeter(scale=args.scale_factor, vfov=args.vfov)
+            PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=pm_hfov),
         ]
 
-        with torch.no_grad():
-            raydrop_refine = unet(test_input)
-            raydrop_mask = torch.where(raydrop_refine > 0.5, 1, 0)
-            for idx in tqdm(range(gt.shape[0])):
-                raydrop_pano = raydrop_refine[idx, [0]]
-                raydrop_pano_mask = raydrop_mask[idx, [0]]
-                intensity_pano = test_input[idx, [1]] * (1 - raydrop_pano_mask)
-                depth_pano = test_input[idx, [2]] * (1 - raydrop_pano_mask)
+        print(f"Refine test {mode}: {len(name_list)} frames, batch size {refine_test_bs}")
+        hole_stats = []
+        with torch.inference_mode():
+            for batch_start in tqdm(range(0, len(name_list), refine_test_bs)):
+                batch_names = name_list[batch_start:batch_start + refine_test_bs]
+                test_input = torch.cat(
+                    [torch.load(os.path.join(test_dir, name), map_location="cpu").unsqueeze(0).float()
+                     for name in batch_names],
+                    dim=0,
+                ).cuda(non_blocking=True)
+                gt = torch.cat(
+                    [torch.load(os.path.join(gt_dir, name), map_location="cpu").unsqueeze(0).float()
+                     for name in batch_names],
+                    dim=0,
+                ).cuda(non_blocking=True)
 
-                gt_raydrop_pano = gt[idx, [0]]
-                gt_intensity_pano = gt[idx, [1]]
-                gt_depth_pano = gt[idx, [2]]
+                raydrop_refine = unet(test_input)
+                raydrop_mask = torch.where(raydrop_refine > 0.5, 1, 0)
 
-                grid = [visualize_depth(gt_depth_pano, scale_factor=args.scale_factor),
-                        visualize_depth(depth_pano, scale_factor=args.scale_factor),
-                        gt_intensity_pano.clamp(0, 1).repeat(3, 1, 1),
-                        intensity_pano.clamp(0, 1).repeat(3, 1, 1), ]
-                grid = make_grid(grid, nrow=1, padding=0)
-                save_image(grid, os.path.join(outdir, name_list[idx].replace(".pt", ".png")))
-                save_ply(pano_to_lidar(depth_pano, args.vfov, (-180, 180)),
-                         os.path.join(outdir, name_list[idx].replace(".pt", ".ply")))
+                ego_body_dir = os.path.join(args.model_path, "ray_drop_datasets", "ego_body")
+                dead_dir = os.path.join(args.model_path, "ray_drop_datasets", "blind_dead")
+                for idx, name in enumerate(batch_names):
+                    raydrop_pano = raydrop_refine[idx, [0]]
+                    dead_ok = None
+                    dead_path = os.path.join(dead_dir, name)
+                    if dead_mask_enabled(args) and os.path.isfile(dead_path):
+                        dead_pack = torch.load(dead_path, map_location=raydrop_pano.device)
+                        _, _, raydrop_pano = force_dead_drop(None, None, raydrop_pano, dead_pack[[0]])
+                        dead_ok = dead_pack[[1]] <= 0.5
+                    raydrop_pano_mask = torch.where(raydrop_pano > 0.5, 1, 0)
+                    intensity_pano = test_input[idx, [1]] * (1 - raydrop_pano_mask)
+                    depth_pano = test_input[idx, [2]] * (1 - raydrop_pano_mask)
 
-                for i, metric in enumerate(metrics):
-                    if i == 0:  # hard code
-                        metric.update(raydrop_pano, gt_raydrop_pano)
-                    elif i == 1:
-                        metric.update(intensity_pano, gt_intensity_pano)
+                    # Re-paste this frame's GT AABB body RV after UNet raydrop.
+                    if getattr(args, "ego_body_infer_replace", True):
+                        ego_path = os.path.join(ego_body_dir, name)
+                        if os.path.isfile(ego_path):
+                            from utils.ego_body_mask import paste_gt_ego_body_rv
+                            ego_pack = torch.load(ego_path, map_location=depth_pano.device)
+                            if ego_pack.ndim == 3 and ego_pack.shape[0] >= 3:
+                                depth_pano, intensity_pano, raydrop_pano = paste_gt_ego_body_rv(
+                                    depth_pano, intensity_pano, raydrop_pano,
+                                    ego_pack[[0]], ego_pack[[1]], ego_pack[[2]])
+
+                    gt_raydrop_pano = gt[idx, [0]]
+                    gt_intensity_pano = gt[idx, [1]]
+                    gt_depth_pano = gt[idx, [2]]
+                    od_valid = gt[idx, [3]] > 0.5 if gt.shape[1] > 3 else None
+                    if od_valid is not None:
+                        depth_eval = depth_pano * od_valid.float()
+                        intensity_eval = intensity_pano * od_valid.float()
                     else:
-                        metric.update(depth_pano, gt_depth_pano)
+                        depth_eval = depth_pano
+                        intensity_eval = intensity_pano
+                    static_valid = gt_depth_pano > 0
+                    if od_valid is not None:
+                        static_valid = static_valid & od_valid
+                    hole_stats.append(compute_hole_stats(depth_eval, gt_depth_pano, od_valid))
 
-            # Ray drop
-            RMSE, Acc, F1 = metrics[0].measure()
-            # Intensity
-            rmse_i, medae_i, lpips_loss_i, ssim_i, psnr_i = metrics[1].measure()
-            # depth
-            rmse_d, medae_d, lpips_loss_d, ssim_d, psnr_d = metrics[2].measure()
-            C_D, F_score = metrics[3].measure().astype(float)
+                    grid = [visualize_depth(gt_depth_pano, scale_factor=args.scale_factor),
+                            visualize_depth(depth_eval, scale_factor=args.scale_factor),
+                            gt_intensity_pano.clamp(0, 1).repeat(3, 1, 1),
+                            intensity_eval.clamp(0, 1).repeat(3, 1, 1), ]
+                    grid = make_grid(grid, nrow=1, padding=0)
+                    save_image(grid, os.path.join(outdir, name.replace(".pt", ".png")))
+                    mask_ = depth_eval > 0
+                    intensity_ = intensity_eval[mask_].reshape(-1, 1)
+                    save_ply(pano_to_lidar(depth_eval, args.vfov, hfov),
+                             os.path.join(outdir, name.replace(".pt", ".ply")), intensity_)
+                    mask_ = gt_depth_pano > 0
+                    intensity_ = gt_intensity_pano[mask_].reshape(-1, 1)
+                    save_ply(pano_to_lidar(gt_depth_pano, args.vfov, hfov),
+                             os.path.join(outdir, name.replace(".pt", "_gt.ply")), intensity_)
 
-            with open(os.path.join(outdir, "metrics.json"), "w") as f:
-                json.dump({"split": f"{mode}", "iteration": "refine",
-                           "Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
-                           "Point Cloud": {"C-D": C_D, "F-score": F_score},
-                           "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_loss_d, "SSIM": ssim_d, "PSNR": psnr_d},
-                           "Intensity": {"RMSE": rmse_i, "MedAE": medae_i, "LPIPS": lpips_loss_i, "SSIM": ssim_i, "PSNR": psnr_i},
-                           }, f, indent=1)
+                    for i, metric in enumerate(metrics):
+                        if i == 0:  # hard code
+                            raydrop_valid = od_valid
+                            if dead_ok is not None:
+                                raydrop_valid = dead_ok if raydrop_valid is None else (raydrop_valid & dead_ok)
+                            metric.update(raydrop_pano, gt_raydrop_pano, valid_mask=raydrop_valid)
+                        elif i == 1:
+                            metric.update(intensity_eval, gt_intensity_pano, valid_mask=static_valid)
+                        elif i == 2:
+                            metric.update(depth_eval, gt_depth_pano, valid_mask=static_valid)
+                        else:
+                            metric.update(depth_eval, gt_depth_pano)
+
+                del test_input, gt, raydrop_refine, raydrop_mask
+                torch.cuda.empty_cache()
+
+        # Ray drop
+        RMSE, Acc, F1 = metrics[0].measure()
+        # Intensity
+        rmse_i, medae_i, lpips_loss_i, ssim_i, psnr_i = metrics[1].measure()
+        # depth
+        rmse_d, medae_d, lpips_loss_d, ssim_d, psnr_d = metrics[2].measure()
+        C_D, F_score = metrics[3].measure().astype(float)
+
+        hole_payload = {}
+        if hole_stats:
+            keys = hole_stats[0].keys()
+            hole_payload = {k: float(np.mean([s[k] for s in hole_stats])) for k in keys}
+
+        with open(os.path.join(outdir, "metrics.json"), "w") as f:
+            refine_metrics = {"split": f"{mode}", "iteration": "refine",
+                       "Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
+                       "Point Cloud": {"C-D": C_D, "F-score": F_score},
+                       "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_loss_d, "SSIM": ssim_d, "PSNR": psnr_d},
+                       "Intensity": {"RMSE": rmse_i, "MedAE": medae_i, "LPIPS": lpips_loss_i, "SSIM": ssim_i, "PSNR": psnr_i},
+                       }
+            if hole_payload:
+                refine_metrics["Holes"] = hole_payload
+            json.dump(refine_metrics, f, indent=1)
+
+        if training_logger is not None:
+            training_logger.log_eval_metrics(args.iterations, f"{mode}_refine", {
+                "Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
+                "Point Cloud": {"C-D": C_D, "F-score": F_score},
+                "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_loss_d, "SSIM": ssim_d, "PSNR": psnr_d},
+                "Intensity": {"RMSE": rmse_i, "MedAE": medae_i, "LPIPS": lpips_loss_i, "SSIM": ssim_i, "PSNR": psnr_i},
+            })
+
+    del unet
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -674,21 +1017,25 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--debug_cuda", action="store_true")
     parser.add_argument("--test_only", action="store_true")
+    parser.add_argument("--refine_only", action="store_true",
+                        help="Skip GS training; run UNet refine (+ refine_test) on existing ray_drop_datasets")
     parser.add_argument("--median_depth", action="store_true")
-    parser.add_argument("--show_log", action="store_true")
-    args_read, _ = parser.parse_known_args()
+    parser.add_argument("--show_log", action="store_true",
+                        help="Print training log to terminal (default: write to model_path/log.txt)")
+    args_read, cli_unknown = parser.parse_known_args()
 
     base_conf = OmegaConf.load(args_read.base_config)
     second_conf = OmegaConf.load(args_read.config)
-    cli_conf = OmegaConf.from_cli()
+    cli_dotlist = [u for u in cli_unknown if "=" in u]
+    cli_conf = OmegaConf.from_dotlist(cli_dotlist)
     args = OmegaConf.merge(base_conf, second_conf, cli_conf)
     OmegaConf.update(args, "start_checkpoint", args_read.start_checkpoint)
     OmegaConf.update(args, "debug_cuda", args_read.debug_cuda)
     OmegaConf.update(args, "test_only", args_read.test_only)
     OmegaConf.update(args, "median_depth", args_read.median_depth)
 
-    if os.path.exists(args.model_path) and not args.test_only and args.start_checkpoint is None:
-        shutil.rmtree(args.model_path)
+    # if os.path.exists(args.model_path) and not args.test_only and args.start_checkpoint is None:
+        # shutil.rmtree(args.model_path)
     os.makedirs(args.model_path, exist_ok=True)
 
     if not args.dynamic:
@@ -721,37 +1068,55 @@ if __name__ == "__main__":
     print(args)
 
     print("Optimizing " + args.model_path)
-    with open(os.path.join(args.model_path, 'setting.txt'), 'w') as f:
-        f.writelines('------------------ start ------------------' + '\n')
-        for eachArg, value in args.items():
-            f.writelines(eachArg + ' : ' + str(value) + '\n')
-        f.writelines('------------------- end -------------------')
+    if not args_read.refine_only:
+        with open(os.path.join(args.model_path, 'setting.txt'), 'w') as f:
+            f.writelines('------------------ start ------------------' + '\n')
+            for eachArg, value in args.items():
+                f.writelines(eachArg + ' : ' + str(value) + '\n')
+            f.writelines('------------------- end -------------------')
 
-    if os.path.exists(os.path.join(args.model_path, 'ray_drop_datasets')) and not args.test_only:
-        shutil.rmtree(os.path.join(args.model_path, 'ray_drop_datasets'))
-    os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets'), exist_ok=True)
-    os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'gt'), exist_ok=True)
-    os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'render_train'), exist_ok=True)
-    os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'render_test'), exist_ok=True)
-    os.makedirs(os.path.join(args.model_path, 'ckpt'), exist_ok=True)
+        os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets'), exist_ok=True)
+        os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'gt'), exist_ok=True)
+        os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'render_train'), exist_ok=True)
+        os.makedirs(os.path.join(args.model_path, 'ray_drop_datasets', 'render_test'), exist_ok=True)
+        os.makedirs(os.path.join(args.model_path, 'ckpt'), exist_ok=True)
 
     if not args.test_only and not args.debug_cuda and not args_read.show_log:
-        f = open(os.path.join(args.model_path, 'log.txt'), 'w')
+        log_path = os.path.join(args.model_path, 'log.txt')
+        print(f"[GS-LiDAR] Terminal output redirected to {log_path}")
+        print("[GS-LiDAR] Use --show_log to print here, or: tail -f", log_path)
+        if not args_read.refine_only:
+            print("[GS-LiDAR] Loading dataset (GACRT ~206 frames) may take several minutes before the training bar appears.")
+        f = open(log_path, 'a' if args_read.refine_only else 'w', buffering=1)
         sys.stdout = f
         sys.stderr = f
     seed_everything(args.seed)
 
-    if not args.test_only:
+    global training_logger
+    if not args.test_only and not args_read.refine_only and args.logger_backend != "none":
+        training_logger = TrainingLogger(args)
+    else:
+        training_logger = None
+
+    if args_read.refine_only:
+        print("\n--refine_only: skip GS training, use existing ray_drop_datasets.")
+    else:
         training(args)
         torch.cuda.empty_cache()
-    # Training done
-    print("\nTraining complete.")
+        print("\nTraining complete.")
 
-    if not args.test_only:
+    if not args.test_only or args_read.refine_only:
         refine()
         torch.cuda.empty_cache()
 
-    refine_test()
-    print("\nRefine complete.")
+    refine_ckpt = os.path.join(args.model_path, "ckpt", "refine.pth")
+    if os.path.exists(refine_ckpt):
+        refine_test()
+        print("\nRefine complete.")
+    else:
+        print(f"\nSkip refine_test: {refine_ckpt} not found. "
+              "Finish the last training eval (writes ray_drop_datasets) then run refine.")
+    if training_logger is not None:
+        training_logger.close()
     sys.stdout = sys.__stdout__
     sys.stderr = sys.__stderr__

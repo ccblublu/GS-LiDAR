@@ -57,6 +57,13 @@ from utils.system_utils import save_ply
 EPS = 1e-5
 
 
+def normalize_obj_id(obj_id):
+    """GACRT pkl may store obj_ids as str, numpy.str_, or int."""
+    if isinstance(obj_id, np.generic):
+        obj_id = obj_id.item()
+    return str(obj_id)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Render GS-LiDAR scenes with selected dynamic objects removed (inference only)."
@@ -68,8 +75,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory (default: model_path/render_without_object/...)")
     parser.add_argument("--split", type=str, default="test", choices=["train", "test", "all"])
-    parser.add_argument("--obj_id", type=int, action="append", default=None,
-                        help="Target obj_id to remove; repeatable for multiple objects")
+    parser.add_argument("--obj_id", type=str, action="append", default=None,
+                        help="Target obj_id to remove (str or int); repeatable for multiple objects")
     parser.add_argument("--remove_all_dynamic", action="store_true",
                         help="Remove all dynamic Gaussians (ignore --obj_id)")
     parser.add_argument("--bbox_scale", type=float, default=1.15,
@@ -88,6 +95,11 @@ def parse_args():
                         help="Skip saving point cloud ply")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Limit number of frames to render (for quick tests)")
+    parser.add_argument(
+        "--sensor_id", type=int, action="append", default=None,
+        help="Only render these blind-lidar slots (0=left,1=right,2=front,3=back). "
+             "Default: all sensors present in the scene.",
+    )
     parser.add_argument("--median_depth", action="store_true")
     known_args, cli_overrides = parser.parse_known_args()
     return known_args, cli_overrides
@@ -177,7 +189,9 @@ def load_od_context(conf):
     pkl_data = load_pkl_compat(pkl_path)
     dynamic_labels = set(getattr(conf, "od_dynamic_labels", [0, 1, 2, 5, 7]))
     min_disp = getattr(conf, "od_min_displacement", 0.5)
-    moving_obj_ids, obj_velocities = identify_moving_objects(pkl_data, dynamic_labels, min_disp)
+    min_speed = getattr(conf, "od_min_speed", None)
+    moving_obj_ids, obj_velocities = identify_moving_objects(
+        pkl_data, dynamic_labels, min_disp, min_speed=min_speed)
     od_by_path = build_od_annotations_by_lidar_path(pkl_data, moving_obj_ids)
     return moving_obj_ids, obj_velocities, od_by_path
 
@@ -192,7 +206,10 @@ def scale_bbox(bbox, scale):
 
 def target_bboxes_for_frame(od_by_path, lidar_path, target_obj_ids):
     annotations = od_by_path.get(lidar_path, [])
-    return [bbox for obj_id, bbox in annotations if obj_id in target_obj_ids]
+    return [
+        bbox for obj_id, bbox in annotations
+        if normalize_obj_id(obj_id) in target_obj_ids
+    ]
 
 
 def build_gaussian_keep_mask(
@@ -303,6 +320,13 @@ def render_range_map_masked(args, cam_front, cam_back, gaussians, background, en
         raydrop_pano[:, :, breaks[2]:breaks[3]] = raydrop_render[:, :, 0:(breaks[3] - breaks[2])]
         raydrop_pano[:, :, breaks[0]:breaks[1]] = raydrop_render[:, :, (w - breaks[1] + breaks[0]):w]
 
+    if getattr(args, "ego_body_infer_replace", True):
+        from utils.ego_body_mask import composite_ego_body_pano
+        dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+        depth_pano, intensity_sh_pano, raydrop_pano = composite_ego_body_pano(
+            depth_pano, intensity_sh_pano, raydrop_pano,
+            cam_front, cam_back, [h, w], args.vfov, args.hfov, dilate=dilate)
+
     return depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano
 
 
@@ -325,9 +349,30 @@ def select_cameras(scene, conf, split, val_frame_ids):
     else:
         cameras = train_cams + test_cams
 
-    # Keep forward/back pairs: even indices are forward cameras.
-    frame_ids = sorted({cam.colmap_id for cam in cameras if cam.towards == "forward"})
+    # Real sequence frame indices (NOT colmap_id). Blind lidars share frame_idx
+    # across sensors; colmap_id = slot * n_frames + frame_idx.
+    frame_ids = sorted({
+        int(cam.frame_idx) if getattr(cam, "frame_idx", None) is not None
+        else int(cam.colmap_id)
+        for cam in cameras if cam.towards == "forward"
+    })
     return cameras, frame_ids
+
+
+def list_sensor_ids(cameras):
+    """Sorted sensor_id values present on forward cameras (0=left … for QT128)."""
+    return sorted({
+        int(getattr(cam, "sensor_id", 0))
+        for cam in cameras if cam.towards == "forward"
+    })
+
+
+# Blind QT128 slot → name (matches scene.gacrt_loader.BLIND_LIDARS slots).
+SENSOR_SLOT_NAMES = {0: "left", 1: "right", 2: "front", 3: "back"}
+
+
+def sensor_name(sensor_id):
+    return SENSOR_SLOT_NAMES.get(int(sensor_id), f"s{int(sensor_id)}")
 
 
 def default_output_dir(model_path, args_read):
@@ -343,10 +388,12 @@ def default_output_dir(model_path, args_read):
 def list_moving_objects(conf):
     moving_obj_ids, obj_velocities, _ = load_od_context(conf)
     print(f"Moving objects in {conf.sequence_id} ({len(moving_obj_ids)} total):")
-    for obj_id in sorted(moving_obj_ids):
+    for obj_id in sorted(moving_obj_ids, key=normalize_obj_id):
         vel = obj_velocities.get(obj_id, np.zeros(3))
         speed = float(np.linalg.norm(vel))
-        print(f"  obj_id={obj_id:>6d}  |velocity|={speed:.3f} m/s  v=({vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f})")
+        obj_id_str = normalize_obj_id(obj_id)
+        print(f"  obj_id={obj_id_str:>12s}  |velocity|={speed:.3f} m/s  "
+              f"v=({vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f})")
 
 
 def load_model(conf, iteration=None, use_raydrop=True):
@@ -370,7 +417,8 @@ def load_model(conf, iteration=None, use_raydrop=True):
         prior_path = ckpt_path.replace("chkpnt", "lidar_raydrop_prior_chkpnt")
         if os.path.exists(prior_path):
             start_h, start_w = scene.getWH()
-            env_map = RayDropPrior(h=start_h, w=start_w).cuda()
+            n_sensors = int(getattr(conf, "n_lidar_sensors", 1) or 1)
+            env_map = RayDropPrior(h=start_h, w=start_w, n_sensors=n_sensors).cuda()
             (prior_params, _) = torch.load(prior_path, map_location="cuda")
             env_map.restore(prior_params)
         else:
@@ -379,10 +427,37 @@ def load_model(conf, iteration=None, use_raydrop=True):
     return scene, gaussians, env_map, iteration
 
 
-def camera_pair_for_frame(cameras, frame_idx, n_frames):
-    cam_front = next(c for c in cameras if c.colmap_id == frame_idx and c.towards == "forward")
-    cam_back = next(c for c in cameras if c.colmap_id == frame_idx + n_frames and c.towards == "backward")
+def camera_pair_for_frame(cameras, frame_idx, n_frames, sensor_id=0):
+    """Return (forward, backward) pair for one frame and one lidar sensor."""
+    sensor_id = int(sensor_id)
+    frame_idx = int(frame_idx)
+
+    def _match(cam, towards):
+        if cam.towards != towards:
+            return False
+        if int(getattr(cam, "sensor_id", 0)) != sensor_id:
+            return False
+        fi = getattr(cam, "frame_idx", None)
+        if fi is not None:
+            return int(fi) == frame_idx
+        return cam.colmap_id % n_frames == frame_idx
+
+    cam_front = next(c for c in cameras if _match(c, "forward"))
+    cam_back = next(c for c in cameras if _match(c, "backward"))
     return cam_front, cam_back
+
+
+def iter_frame_sensor_pairs(cameras, frame_ids, n_frames, sensor_ids=None):
+    """Yield (frame_idx, sensor_id, cam_front, cam_back) for each available pair."""
+    if sensor_ids is None:
+        sensor_ids = list_sensor_ids(cameras)
+    for frame_idx in frame_ids:
+        for sid in sensor_ids:
+            try:
+                cam_f, cam_b = camera_pair_for_frame(cameras, frame_idx, n_frames, sid)
+            except StopIteration:
+                continue
+            yield frame_idx, sid, cam_f, cam_b
 
 
 def main():
@@ -413,10 +488,11 @@ def main():
     cameras, frame_ids = select_cameras(scene, conf, args_read.split, val_frame_ids)
 
     od_by_path = {}
-    target_obj_ids = set(args_read.obj_id or [])
+    target_obj_ids = {normalize_obj_id(x) for x in (args_read.obj_id or [])}
     if conf.scene_type == "Gacrt":
         moving_obj_ids, _, od_by_path = load_od_context(conf)
-        unknown = target_obj_ids - moving_obj_ids
+        moving_obj_ids_norm = {normalize_obj_id(x) for x in moving_obj_ids}
+        unknown = target_obj_ids - moving_obj_ids_norm
         if unknown:
             print(f"[Warn] obj_id not in moving set: {sorted(unknown)}")
 
@@ -441,9 +517,24 @@ def main():
     if args_read.max_frames is not None:
         frame_ids = frame_ids[: args_read.max_frames]
 
+    sensor_ids = (
+        sorted(set(args_read.sensor_id)) if args_read.sensor_id
+        else list_sensor_ids(cameras)
+    )
+    multi_sensor = len(sensor_ids) > 1
+    pairs = list(iter_frame_sensor_pairs(cameras, frame_ids, n_frames, sensor_ids))
+    if not pairs:
+        raise SystemExit(
+            f"No camera pairs for frame_ids={frame_ids} sensor_ids={sensor_ids}"
+        )
+    meta["sensor_ids"] = sensor_ids
+
     with torch.no_grad():
-        for frame_idx in tqdm(frame_ids, desc="Render without object"):
-            cam_front, cam_back = camera_pair_for_frame(cameras, frame_idx, n_frames)
+        for frame_idx, sid, cam_front, cam_back in tqdm(pairs, desc="Render without object"):
+            sname = sensor_name(sid)
+            frame_tag = (
+                f"{frame_idx:03d}_{sname}" if multi_sensor else f"{frame_idx:03d}"
+            )
             lidar_path = frame_lidar_path(poses, frame_idx, conf)
             bboxes = target_bboxes_for_frame(od_by_path, lidar_path, target_obj_ids)
 
@@ -467,7 +558,6 @@ def main():
             depth_base, inten_base, _ = apply_raydrop_mask(depth_base[[0]], inten_base, raydrop_base)
             depth_rm, inten_rm, _ = apply_raydrop_mask(depth_rm[[0]], inten_rm, raydrop_rm)
 
-            frame_tag = f"{frame_idx:03d}"
             if not args_read.no_ply:
                 points = pano_to_lidar(depth_rm, conf.vfov, (-180, 180)) / conf.scale_factor
                 save_ply(points, os.path.join(output_dir, f"{frame_tag}.ply"))
@@ -488,6 +578,8 @@ def main():
 
             meta["frames"].append({
                 "frame_idx": frame_idx,
+                "sensor_id": sid,
+                "sensor": sname,
                 "lidar_path": lidar_path,
                 "removed_gaussians": removed_count,
                 "target_bboxes": len(bboxes),
@@ -496,7 +588,10 @@ def main():
     with open(os.path.join(output_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"Done. Results saved to {output_dir}")
+    print(
+        f"Done. {len(pairs)} renders "
+        f"({len(frame_ids)} frames × {len(sensor_ids)} sensors) → {output_dir}"
+    )
 
 
 if __name__ == "__main__":

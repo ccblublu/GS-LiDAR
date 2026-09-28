@@ -130,6 +130,13 @@ python scripts/compare_2dgs_3dgs.py
   <img src="assets/2dgs_vs_3dgs.png"/>
 </div><br/>
 
+## Hybrid with XSIM
+
+Cross-repo fusion design (static GS-LiDAR background + XSIM dynamic instances):  
+[../docs/hybrid_gslidar_xsim_dev.md](../docs/hybrid_gslidar_xsim_dev.md)
+
+Key scripts: `configs/gacrt_static_bg.yaml`, `scripts/render_hybrid.py`
+
 ## 📜 BibTeX
 ``` bibtex
 @inproceedings{jiang2025gslidar,

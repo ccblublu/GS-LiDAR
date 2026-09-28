@@ -185,7 +185,8 @@ __forceinline__ __device__ bool in_frustum_panorama(
 	float VFOV_max,
 	float HFOV_min,
 	float HFOV_max,
-	float scale_factor)
+	float scale_factor,
+	float near_dist)
 {
 	// Bring points to screen space
 	float center_v = (VFOV_max + VFOV_min) / 2;
@@ -196,7 +197,7 @@ __forceinline__ __device__ bool in_frustum_panorama(
 	float half_range_h = (HFOV_max - HFOV_min) / 2;
 	float ratio_h = abs((mean3d.y - center_h) / half_range_h);
 
-	if (mean3d.z <= near_n * scale_factor || ratio_v > 1.3 || ratio_h > 1.3)
+	if (mean3d.z <= near_dist * scale_factor || ratio_v > 1.3 || ratio_h > 1.3)
 	{
 		return false;
 	}

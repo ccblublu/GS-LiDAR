@@ -19,7 +19,11 @@ class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, vfov=None, hfov=None, uid=0,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", timestamp=0.0,
                  resolution=None, image_path=None,
-                 pts_depth=None, pts_intensity=None, towards=None
+                 pts_depth=None, pts_intensity=None, towards=None,
+                 od_loss_mask=None, pts_depth_input=None,
+                 sensor_id=0, frame_idx=None, ego_body_mask=None,
+                 ego_body_points_cam=None, ego_body_intensity=None,
+                 blind_dead_mask=None, blind_ignore_mask=None,
                  ):
         super(Camera, self).__init__()
 
@@ -32,6 +36,11 @@ class Camera(nn.Module):
         self.resolution = resolution
         self.image_path = image_path
         self.towards = towards
+        self.sensor_id = int(sensor_id or 0)
+        self.frame_idx = None if frame_idx is None else int(frame_idx)
+        # Rigid body returns in this camera frame; pasted at inference.
+        self.ego_body_points_cam = ego_body_points_cam
+        self.ego_body_intensity = ego_body_intensity
 
         try:
             self.data_device = torch.device(data_device)
@@ -46,6 +55,11 @@ class Camera(nn.Module):
         # Store GT depth/intensity on CPU to save GPU memory; move to GPU on access via .cuda()
         self.pts_depth = pts_depth.cpu() if pts_depth is not None else pts_depth
         self.pts_intensity = pts_intensity.cpu() if pts_intensity is not None else pts_intensity
+        self.od_loss_mask = od_loss_mask.cpu() if od_loss_mask is not None else od_loss_mask
+        self.ego_body_mask = ego_body_mask.cpu() if ego_body_mask is not None else ego_body_mask
+        self.blind_dead_mask = blind_dead_mask.cpu() if blind_dead_mask is not None else None
+        self.blind_ignore_mask = blind_ignore_mask.cpu() if blind_ignore_mask is not None else None
+        self.pts_depth_input = pts_depth_input.cpu() if pts_depth_input is not None else pts_depth_input
 
         self.zfar = 1000.0
         self.znear = 0.01

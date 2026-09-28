@@ -11,6 +11,8 @@ plyfile
 opencv_python
 opencv_contrib_python
 tensorboardX
+wandb
 matplotlib
 camtools
 lpips
+python-lzf

@@ -164,7 +164,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
-		const float scale_factor)
+		const float scale_factor,
+		const float near_dist)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -257,7 +258,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	const float HFOV_max = hfov_max * MY_PI / 180;
 	const float HFOV_min = hfov_min * MY_PI / 180;
 
-	const float near = near_n * scale_factor;
+	const float near = near_dist * scale_factor;
+	// Distortion keeps the fixed near_n normalization; closer depths clamp to it.
+	const float near_distortion = near_n * scale_factor;
 	const float far = far_n * scale_factor;
 
 	// Traverse all Gaussians
@@ -370,8 +373,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			}
 
 			float dL_dweight = 0;
-			const float m_d = far / (far - near) * (1 - near / depth);
-			const float dmd_dd = (far * near) / ((far - near) * depth * depth);
+			const float m_d = far / (far - near_distortion) * (1 - near_distortion / max(depth, near_distortion));
+			const float dmd_dd = depth > near_distortion
+				? (far * near_distortion) / ((far - near_distortion) * depth * depth) : 0.0f;
 			dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_ddistortion;
 			dL_dalpha += dL_dweight - last_dL_dT;
 			// propagate the current weight W_{i} to next weight W_{i-1}
@@ -807,7 +811,8 @@ void BACKWARD::render(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
 		ranges,
@@ -836,5 +841,6 @@ void BACKWARD::render(
 		vfov_max,
 		hfov_min,
 		hfov_max,
-		scale_factor);
+		scale_factor,
+		near_dist);
 }

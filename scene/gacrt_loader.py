@@ -6,6 +6,7 @@
 #
 import glob
 import os
+import struct
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -14,11 +15,456 @@ from utils.graphics_utils import BasicPointCloud
 import json
 import pickle
 from collections import defaultdict
+from utils.od_loss_mask import build_od_loss_mask, transform_bboxes_pca
 
-LIDAR2EGO = np.array([[ -0.0290051,   -0.999232,   0.0266734,     1.10341 ],
+# GACRT014 default; override via config `lidar2ego` for other vehicles.
+DEFAULT_LIDAR2EGO = np.array([[ -0.0290051,   -0.999232,   0.0266734,     1.10341 ],
                 [ 0.999562,  -0.0291982, -0.00689323,  0.00806815 ],
                 [ 0.00766665,   0.0264612,    0.999621,     1.93886 ],
                 [ 0.0, 0.0, 0.0, 1.0 ]])
+LIDAR2EGO = DEFAULT_LIDAR2EGO  # backward-compatible alias
+
+_PCD_DTYPE = {
+    ("F", 4): "<f4", ("F", 8): "<f8",
+    ("I", 1): "<i1", ("I", 2): "<i2", ("I", 4): "<i4", ("I", 8): "<i8",
+    ("U", 1): "<u1", ("U", 2): "<u2", ("U", 4): "<u4", ("U", 8): "<u8",
+}
+
+
+def get_lidar2ego(args=None, json_data=None):
+    """Return 4x4 lidar-to-ego used only to place the panoramic RV camera.
+
+    When points and poses are both already in the IMU frame
+    (``pose_frame`` / ``point_frame`` == ``imu``), this must be identity —
+    applying a lidar-top extrinsic would incorrectly rotate/translate the RV
+    camera relative to the fused IMU cloud.
+
+    For ``ego``-frame GACRT clips that still want the RV at lidar-top, keep
+    using config ``lidar2ego`` (do not force identity).
+    """
+    pose_frame = None if json_data is None else json_data.get("pose_frame")
+    point_frame = None if json_data is None else json_data.get("point_frame")
+    if pose_frame is None and args is not None:
+        pose_frame = getattr(args, "pose_frame", None)
+    if point_frame is None and args is not None:
+        point_frame = getattr(args, "point_frame", None)
+
+    if pose_frame == "imu" and point_frame == "imu":
+        return np.eye(4, dtype=np.float64)
+
+    mat = None if args is None else getattr(args, "lidar2ego", None)
+    if mat is None:
+        return DEFAULT_LIDAR2EGO.copy()
+    arr = np.array(mat, dtype=np.float64)
+    if arr.shape != (4, 4):
+        raise ValueError(f"lidar2ego must be 4x4, got {arr.shape}")
+    return arr
+
+
+# KITTI-360 / GS-LiDAR axis remap: body (x-fwd,y-left,z-up) → RV camera.
+BODY_TO_RV = np.array([
+    [0, -1, 0, 0],
+    [0, 0, -1, 0],
+    [1, 0, 0, 0],
+    [0, 0, 0, 1],
+], dtype=np.float64)
+
+# Fused PCD source channel. 0 is the top OT128 and is not a QT128 camera.
+# Slots are stable raydrop indices even when a source is missing in a frame.
+BLIND_LIDARS = (
+    (1, "left"),
+    (2, "right"),
+    (3, "front"),
+    (4, "back"),
+)
+
+# lidar-top-to-car is nearly a pure yaw: sensor x=left, y=back, z=up.
+# Remap that housing frame to x-forward, y-left, z-up before BODY_TO_RV.
+HESAI_TO_BODY = np.array([
+    [0, -1, 0, 0],
+    [1, 0, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+], dtype=np.float64)
+
+
+def _find_calib_4x4(obj):
+    if isinstance(obj, dict):
+        data = obj.get("data")
+        if obj.get("cols") == 4 and obj.get("rows") == 4 and isinstance(data, list):
+            arr = np.asarray(data, dtype=np.float64)
+            if arr.shape == (4, 4):
+                return arr
+        for value in obj.values():
+            found = _find_calib_4x4(value)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_calib_4x4(value)
+            if found is not None:
+                return found
+    return None
+
+
+def load_calib_4x4(path):
+    with open(path, "r") as f:
+        mat = _find_calib_4x4(json.load(f))
+    if mat is None:
+        raise ValueError(f"No 4x4 sensor_calib in {path}")
+    return mat
+
+
+def load_blind_extrinsics(calib_dir):
+    """Lidar-to-IMU for each blind QT128.
+
+    Calib files are lidar-to-car and gnss-to-lidar-top. SLAM poses are IMU-to-world.
+    IMU is treated as the GNSS frame:
+        T_gnss_to_car = T_lidar_top_to_car @ T_gnss_to_lidar_top
+        T_imu_from_lidar = inv(T_gnss_to_car) @ T_lidar_to_car
+    """
+    calib_dir = os.path.abspath(os.path.expanduser(str(calib_dir)))
+    top_to_car = load_calib_4x4(os.path.join(calib_dir, "calib_lidar_top_to_car.json"))
+    gnss_to_top = load_calib_4x4(os.path.join(calib_dir, "calib_gnss_to_lidar_top.json"))
+    gnss_to_car = top_to_car @ gnss_to_top
+    extrinsics = {}
+    for source_id, name in BLIND_LIDARS:
+        lidar_to_car = load_calib_4x4(
+            os.path.join(calib_dir, f"calib_lidar_{name}_to_car.json"))
+        imu_from_lidar = np.linalg.inv(gnss_to_car) @ lidar_to_car
+        extrinsics[source_id] = {
+            "name": name,
+            "slot": source_id - 1,
+            "imu_from_lidar": imu_from_lidar,
+        }
+        t = imu_from_lidar[:3, 3]
+        print(f"[Blind calib] source {source_id} {name} "
+              f"imu_t=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})")
+    return extrinsics
+
+
+def _apply_transform(points, transform):
+    if len(points) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    homo = np.concatenate(
+        [points.astype(np.float64), np.ones((len(points), 1), dtype=np.float64)], axis=1)
+    return (homo @ np.asarray(transform, dtype=np.float64).T)[:, :3].astype(np.float32)
+
+
+def _rt_from_w2c(w2c):
+    rotation = np.transpose(w2c[:3, :3]).astype(np.float32).copy()
+    translation = w2c[:3, 3].astype(np.float32).copy()
+    return rotation, translation
+
+
+def _backward_rt(rotation, translation):
+    flip = np.array([-1, 0, 0, 0, 1, 0, 0, 0, -1], dtype=np.float32).reshape(3, 3)
+    return rotation @ flip, translation * np.array([-1, 1, -1], dtype=np.float32)
+
+
+def _body_ignore_mask(body_cam, scene_cam, height, width, vfov, hfov):
+    """1 where a body return is the only point on that pixel."""
+    from utils.camera_utils import project_points_to_rv
+    body_depth, _ = project_points_to_rv(body_cam, None, height, width, vfov, hfov)
+    scene_depth, _ = project_points_to_rv(scene_cam, None, height, width, vfov, hfov)
+    return ((body_depth > 0) & (scene_depth == 0)).astype(np.float32)
+
+
+def build_blind_frame_cameras(
+    points_imu, intensity, source, lidar2global, extrinsics, args,
+    frame_idx, n_frames, timestamp, lidar_path,
+):
+    """One camera per blind lidar that has points in this frame.
+
+    Depth uses that lidar's points only, expressed from the lidar origin.
+    Body hits are removed from depth and marked ignore where they leave a hole.
+
+    ``cam_num==1`` (qt128 default): a single 180° half with ``hfov=[-90,90]``.
+    ``cam_num==2``: classic forward + backward halves stitched to 360°.
+    """
+    if source is None:
+        raise RuntimeError("blind_lidar_origins requires a PCD source channel")
+
+    finite = np.isfinite(points_imu).all(axis=1)
+    points_imu = points_imu[finite]
+    intensity = intensity[finite]
+    source = np.asarray(source)[finite]
+    near_r = getattr(args, "ego_near_radius", None)
+    if near_r is not None and float(near_r) > 0:
+        keep = np.linalg.norm(points_imu, axis=1) > float(near_r)
+        points_imu = points_imu[keep]
+        intensity = intensity[keep]
+        source = source[keep]
+
+    height, width = int(args.hw[0]), int(args.hw[1])
+    aabb = getattr(args, "ego_body_aabb", None)
+    n_sensors = len(BLIND_LIDARS)
+    half_only = int(getattr(args, "cam_num", 2) or 2) == 1
+    cameras = []
+    init_chunks = []
+    n_body = 0
+    n_supervise = 0
+
+    for source_id, _name in BLIND_LIDARS:
+        selected = source == source_id
+        if not np.any(selected):
+            continue
+        pts = points_imu[selected]
+        inten = intensity[selected]
+        is_body = points_in_aabb(pts, aabb) if aabb is not None else np.zeros(len(pts), dtype=bool)
+        n_body += int(is_body.sum())
+        scene_pts = pts[~is_body]
+        scene_inten = inten[~is_body]
+        body_pts = pts[is_body]
+        if len(scene_pts) == 0 and len(body_pts) == 0:
+            continue
+
+        spec = extrinsics[source_id]
+        world_from_lidar = lidar2global @ spec["imu_from_lidar"]
+        w2c = BODY_TO_RV @ HESAI_TO_BODY @ np.linalg.inv(world_from_lidar)
+        rotation, translation = _rt_from_w2c(w2c)
+
+        scene_world = _apply_transform(scene_pts, lidar2global)
+        body_world = _apply_transform(body_pts, lidar2global)
+        if len(scene_world):
+            init_chunks.append(scene_world)
+            n_supervise += int(len(scene_world))
+
+        def to_cam(pts_world, rot, trans):
+            if len(pts_world) == 0:
+                return np.zeros((0, 3), dtype=np.float32)
+            return (pts_world @ rot + trans).astype(np.float32)
+
+        scene_cam = to_cam(scene_world, rotation, translation)
+        body_cam = to_cam(body_world, rotation, translation)
+        mask_front = _body_ignore_mask(body_cam, scene_cam, height, width, args.vfov, args.hfov)
+        if len(scene_inten) == 0:
+            scene_inten = np.zeros((0,), dtype=np.float32)
+
+        slot = spec["slot"]
+        uid_front = slot * n_frames + frame_idx
+        cameras.append(CameraInfo(
+            uid=uid_front, R=rotation, T=translation, timestamp=timestamp,
+            pointcloud_camera=scene_cam, intensity=scene_inten.astype(np.float32),
+            towards="forward", lidar_path=lidar_path, sensor_id=slot,
+            frame_idx=frame_idx, ego_body_mask=mask_front,
+            ego_body_points_cam=body_cam if len(body_cam) else None,
+            ego_body_intensity=inten[is_body].astype(np.float32) if np.any(is_body) else None,
+        ))
+        if half_only:
+            continue
+
+        rotation_back, translation_back = _backward_rt(rotation, translation)
+        scene_cam_back = to_cam(scene_world, rotation_back, translation_back)
+        body_cam_back = to_cam(body_world, rotation_back, translation_back)
+        mask_back = _body_ignore_mask(
+            body_cam_back, scene_cam_back, height, width, args.vfov, args.hfov)
+        uid_back = uid_front + n_sensors * n_frames
+        cameras.append(CameraInfo(
+            uid=uid_back, R=rotation_back, T=translation_back, timestamp=timestamp,
+            pointcloud_camera=scene_cam_back, intensity=scene_inten.astype(np.float32),
+            towards="backward", lidar_path=lidar_path, sensor_id=slot,
+            frame_idx=frame_idx, ego_body_mask=mask_back,
+            ego_body_points_cam=body_cam_back if len(body_cam_back) else None,
+            ego_body_intensity=inten[is_body].astype(np.float32) if np.any(is_body) else None,
+        ))
+
+    body_imu_chunks = []
+    body_imu_inten = []
+    for source_id, _name in BLIND_LIDARS:
+        selected = source == source_id
+        if not np.any(selected) or aabb is None:
+            continue
+        pts = points_imu[selected]
+        inten_s = intensity[selected]
+        is_body = points_in_aabb(pts, aabb)
+        if np.any(is_body):
+            body_imu_chunks.append(pts[is_body])
+            body_imu_inten.append(inten_s[is_body])
+    body_imu = (np.concatenate(body_imu_chunks, axis=0) if body_imu_chunks
+                else np.zeros((0, 3), dtype=np.float32))
+    body_imu_i = (np.concatenate(body_imu_inten, axis=0) if body_imu_inten
+                  else np.zeros((0,), dtype=np.float32))
+
+    if init_chunks:
+        init_world = np.concatenate(init_chunks, axis=0)
+    else:
+        init_world = np.zeros((0, 3), dtype=np.float32)
+    return cameras, init_world, n_body, n_supervise, body_imu, body_imu_i
+
+
+def load_lidar_xyz_intensity(path, n_feats=5, return_source=False):
+    """Load xyz + intensity from a GACRT .bin or binary / binary_compressed .pcd.
+
+    .bin: float32 rows of (x, y, z, intensity, ring, ...).
+    .pcd: FIELDS must include x, y, z; intensity/source are optional.
+    """
+    path = str(path)
+    if path.lower().endswith(".pcd"):
+        xyz, intensity, source = _load_pcd_xyz_intensity(path, return_source=True)
+    else:
+        points_raw = np.fromfile(path, dtype=np.float32)
+        if points_raw.size % n_feats != 0:
+            raise ValueError(
+                f"Point cloud size {points_raw.size} is not divisible by n_feats={n_feats}: {path}")
+        points_raw = points_raw.reshape(-1, n_feats)
+        xyz = points_raw[:, :3].astype(np.float32)
+        intensity = points_raw[:, 3].astype(np.float32)
+        source = None
+    if return_source:
+        return xyz, intensity, source
+    return xyz, intensity
+
+
+def _lzf_decompress(data, expected_size):
+    try:
+        import lzf
+    except ImportError as exc:
+        raise ImportError(
+            "binary_compressed PCD requires python-lzf. Install with: pip install python-lzf"
+        ) from exc
+    out = lzf.decompress(data, expected_size)
+    if out is None or len(out) != expected_size:
+        raise ValueError("LZF decompress failed or size mismatch")
+    return out
+
+
+def _load_pcd_xyz_intensity(path, return_source=False):
+    with open(path, "rb") as f:
+        header_lines = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"Invalid PCD (no DATA line): {path}")
+            text = line.decode("ascii", errors="ignore").strip()
+            header_lines.append(text)
+            if text.startswith("DATA"):
+                break
+        meta = {}
+        for line in header_lines:
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                meta[parts[0]] = parts[1]
+        data_mode = meta.get("DATA", "").split()[0]
+        n = int(meta["POINTS"])
+        fields = meta["FIELDS"].split()
+        sizes = list(map(int, meta["SIZE"].split()))
+        types = meta["TYPE"].split()
+        raw = f.read()
+
+    cols = {}
+    if data_mode == "binary":
+        dtype = []
+        for name, sz, tp in zip(fields, sizes, types):
+            key = (tp, sz)
+            if key not in _PCD_DTYPE:
+                raise ValueError(f"Unsupported PCD field {name} type={tp} size={sz} in {path}")
+            dtype.append((name, _PCD_DTYPE[key]))
+        arr = np.frombuffer(raw, dtype=np.dtype(dtype), count=n)
+        for name in arr.dtype.names:
+            cols[name] = np.ascontiguousarray(arr[name])
+    elif data_mode == "binary_compressed":
+        compressed_size, uncompressed_size = struct.unpack_from("<II", raw, 0)
+        dec = _lzf_decompress(raw[8:8 + compressed_size], uncompressed_size)
+        off = 0
+        for name, sz, tp in zip(fields, sizes, types):
+            key = (tp, sz)
+            if key not in _PCD_DTYPE:
+                raise ValueError(f"Unsupported PCD field {name} type={tp} size={sz} in {path}")
+            nbytes = n * sz
+            cols[name] = np.frombuffer(dec[off:off + nbytes], dtype=np.dtype(_PCD_DTYPE[key])).copy()
+            off += nbytes
+    else:
+        raise ValueError(f"Only binary / binary_compressed PCD is supported, got '{data_mode}': {path}")
+
+    if not {"x", "y", "z"}.issubset(cols):
+        raise ValueError(f"PCD missing xyz fields: {path}")
+    xyz = np.stack([cols["x"], cols["y"], cols["z"]], axis=1).astype(np.float32)
+    if "intensity" in cols:
+        intensity = cols["intensity"].astype(np.float32)
+    else:
+        intensity = np.zeros(len(xyz), dtype=np.float32)
+    source = cols["source"].astype(np.int32) if "source" in cols else None
+    if return_source:
+        return xyz, intensity, source
+    return xyz, intensity
+
+
+def points_in_aabb(points, aabb):
+    """Axis-aligned box test. aabb is [[xmin,xmax],[ymin,ymax],[zmin,zmax]] in the point frame."""
+    box = np.asarray(aabb, dtype=np.float64)
+    if box.shape != (3, 2):
+        raise ValueError(f"ego_body_aabb must be 3x2 [[xmin,xmax],[ymin,ymax],[zmin,zmax]], got {box.shape}")
+    return (
+        (points[:, 0] >= box[0, 0]) & (points[:, 0] <= box[0, 1]) &
+        (points[:, 1] >= box[1, 0]) & (points[:, 1] <= box[1, 1]) &
+        (points[:, 2] >= box[2, 0]) & (points[:, 2] <= box[2, 1])
+    )
+
+
+def parse_input_lidar_sources(args):
+    """Normalize config ``input_lidar_source`` to a list of ints, or None.
+
+    Accepts: null | int | [int, ...]  (OmegaConf ListConfig OK).
+    """
+    raw = getattr(args, "input_lidar_source", None)
+    if raw is None:
+        return None
+    if isinstance(raw, (int, np.integer)):
+        return [int(raw)]
+    # list / tuple / OmegaConf list
+    try:
+        return [int(x) for x in list(raw)]
+    except TypeError as exc:
+        raise ValueError(
+            f"input_lidar_source must be null, int, or list of ints, got {type(raw)}: {raw}"
+        ) from exc
+
+
+def filter_lidar_sources(points, intensity, source, args):
+    """Split training-input sources vs all-source supervision; drop 补盲 body hits.
+
+    ``input_lidar_source`` may be a single id (e.g. 0=top) or a list
+    (e.g. [0, 1, 2] = top + left/right 补盲) used for Gaussian init + raydrop.
+
+    Returns:
+        points, intensity, input_mask, n_body, source after near-radius + body filtering.
+    """
+    finite = np.isfinite(points).all(axis=1)
+    points = points[finite]
+    intensity = intensity[finite]
+    if source is not None:
+        source = source[finite]
+
+    near_r = getattr(args, "ego_near_radius", 2.5)
+    if near_r is not None and float(near_r) > 0:
+        keep = np.linalg.norm(points, axis=1) > float(near_r)
+        points = points[keep]
+        intensity = intensity[keep]
+        if source is not None:
+            source = source[keep]
+
+    n_body = 0
+    aabb = getattr(args, "ego_body_aabb", None)
+    body_sources = getattr(args, "ego_body_filter_sources", None)
+    if aabb is not None and source is not None and body_sources:
+        body_src = np.asarray(body_sources, dtype=np.int32)
+        is_fill = np.isin(source, body_src)
+        is_body = is_fill & points_in_aabb(points, aabb)
+        n_body = int(is_body.sum())
+        keep = ~is_body
+        points = points[keep]
+        intensity = intensity[keep]
+        source = source[keep]
+
+    input_ids = parse_input_lidar_sources(args)
+    if input_ids is not None and source is not None:
+        input_mask = np.isin(source, np.asarray(input_ids, dtype=np.int32))
+    else:
+        input_mask = np.ones(len(points), dtype=bool)
+    return points, intensity, input_mask, n_body, source
 
 class NumpyCompatUnpickler(pickle.Unpickler):
     """Unpickler that handles numpy version mismatch between save and load.
@@ -123,16 +569,18 @@ def build_od_annotations_by_lidar_path(pkl_data, moving_obj_ids):
     return od_by_path
 
 
-def identify_moving_objects(pkl_data, dynamic_labels, min_displacement=0.5):
+def identify_moving_objects(pkl_data, dynamic_labels, min_displacement=0.5, min_speed=None):
     """通过 obj_id 追踪识别真正移动中的目标。
 
-    对同一 obj_id 的 bbox 中心在不同关键帧之间计算最大位移，
-    仅当最大位移超过阈值时才认为是移动目标（停放车辆不会被标记为动态）。
+    对同一 obj_id 的 bbox 中心在不同关键帧之间做线性拟合求速度。
+    - 若指定 min_speed：仅当速度模长 > min_speed (m/s) 时视为移动目标。
+    - 否则：使用最大位移 > min_displacement (m) 判定（兼容旧逻辑）。
 
     Args:
         pkl_data: pkl 加载的数据 (list of dicts)
         dynamic_labels: 候选动态类别集合, e.g. {0, 1, 2, 5, 7}
-        min_displacement: 最小位移阈值 (米), 超过此值才认为是移动目标
+        min_displacement: 最小位移阈值 (米), min_speed 未设置时生效
+        min_speed: 最小速度阈值 (m/s), 优先于 min_displacement
 
     Returns:
         moving_obj_ids: set, 移动目标的 obj_id 集合
@@ -162,22 +610,29 @@ def identify_moving_objects(pkl_data, dynamic_labels, min_displacement=0.5):
             continue
         traj.sort(key=lambda x: x[0])
         centers = np.array([c for _, c in traj])
-        # 计算最大位移（相对于首个观测位置）
-        max_disp = np.max(np.linalg.norm(centers - centers[0], axis=1))
-        if max_disp > min_displacement:
+        ts = np.array([t for t, _ in traj])
+        t_mean = ts.mean()
+        dt = ts - t_mean
+        c_mean = centers.mean(axis=0)
+        dc = centers - c_mean
+        v = np.sum(dt[:, None] * dc, axis=0) / (np.sum(dt ** 2) + 1e-8)
+        speed = float(np.linalg.norm(v))
+        if min_speed is not None:
+            is_moving = speed > min_speed
+        else:
+            max_disp = np.max(np.linalg.norm(centers - centers[0], axis=1))
+            is_moving = max_disp > min_displacement
+        if is_moving:
             moving_obj_ids.add(obj_id)
-            # 线性回归求速度: center(t) = c_mean + v * (t - t_mean)
-            ts = np.array([t for t, _ in traj])
-            t_mean = ts.mean()
-            dt = ts - t_mean
-            c_mean = centers.mean(axis=0)
-            dc = centers - c_mean
-            v = np.sum(dt[:, None] * dc, axis=0) / (np.sum(dt ** 2) + 1e-8)
             obj_velocities[obj_id] = v
 
+    if min_speed is not None:
+        threshold_msg = f"Min speed threshold: {min_speed}m/s"
+    else:
+        threshold_msg = f"Min displacement threshold: {min_displacement}m"
     print(f"[OD] Total tracked objects: {len(obj_trajectories)}, "
           f"Moving objects: {len(moving_obj_ids)}, "
-          f"Min displacement threshold: {min_displacement}m")
+          f"{threshold_msg}")
     return moving_obj_ids, obj_velocities
 
 
@@ -255,10 +710,17 @@ def readGacrtInfo(args):
                     ├── 1740908196400000000_640_19.bin
                     └── ...
 
-    Key assumptions about GACRT data:
-        - lidar2ego = Identity (points are in ego coordinate frame)
-        - lidar2global = ego2global
-        - Point cloud format: (x, y, z, intensity, ring_idx) as float32
+    Key assumptions about GACRT / PCI data:
+        - points are in the ego / IMU / vehicle-body frame
+        - lidar2world in the JSON is ego2global (or IMU-to-world)
+        - lidar2ego places the panoramic RV camera; forced to identity when
+          pose_frame=point_frame=imu (fused IMU clouds). ego-frame clips may
+          still use a lidar-top extrinsic.
+        - Point cloud: .bin float32 or binary / binary_compressed .pcd
+        - Optional `source` channel: ``input_lidar_source`` (int or list) selects
+          which ids go into Gaussian init + raydrop; remaining points still
+          supervise depth after body filtering
+        - ego_body_aabb + ego_body_filter_sources drop 补盲 hits on the car body
         - LiDAR FoV: vfov=[-25, 15], hfov=[-180, 180]
 
     The JSON file may contain either keyframes only (40 frames) or all sweeps
@@ -280,6 +742,17 @@ def readGacrtInfo(args):
     json_path = os.path.join(path, sequence_id, f"transforms_{sequence_id}_all.json")
     with open(json_path, "r") as f:
         json_data = json.load(f)
+
+    lidar2ego = get_lidar2ego(args, json_data)
+    if np.allclose(lidar2ego, np.eye(4)):
+        print(f"[Frame] pose_frame={json_data.get('pose_frame')} "
+              f"point_frame={json_data.get('point_frame')} → lidar2ego=I "
+              f"(skip ego2lidar for RV camera)")
+    else:
+        t = lidar2ego[:3, 3]
+        print(f"[Frame] pose_frame={json_data.get('pose_frame')} "
+              f"point_frame={json_data.get('point_frame')} → "
+              f"lidar2ego t=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f})")
 
     poses = json_data["frames"]
     val_frame_ids = set(json_data.get("val_frame_ids", []))
@@ -313,10 +786,11 @@ def readGacrtInfo(args):
         pkl_data = load_pkl_compat(pkl_path)
         dynamic_labels = set(getattr(args, 'od_dynamic_labels', [0, 1, 2, 5, 7]))
         min_disp = getattr(args, 'od_min_displacement', 0.5)
+        min_speed = getattr(args, 'od_min_speed', None)
 
         # Identify moving objects via tracking
         moving_obj_ids, obj_velocities = identify_moving_objects(
-            pkl_data, dynamic_labels, min_disp)
+            pkl_data, dynamic_labels, min_disp, min_speed=min_speed)
 
         # Pre-compute world-frame bboxes for each unique frame (keyframe + sweep)
         od_annotations_by_path = build_od_annotations_by_lidar_path(
@@ -333,6 +807,23 @@ def readGacrtInfo(args):
     points_is_dynamic = []   # per-point dynamic flag
     points_obj_velocity = [] # per-point init velocity
     cam_infos = []
+    n_body_total = 0
+    n_input_total = 0
+    n_supervise_total = 0
+    body_imu_chunks = []
+    body_imu_inten_chunks = []
+    blind_origins = bool(getattr(args, "blind_lidar_origins", False))
+    blind_extrinsics = None
+    if blind_origins:
+        if use_od_labels:
+            raise RuntimeError("blind_lidar_origins does not support use_od_labels")
+        calib_dir = getattr(args, "calib_dir", None)
+        if not calib_dir:
+            raise RuntimeError("blind_lidar_origins requires calib_dir")
+        blind_extrinsics = load_blind_extrinsics(calib_dir)
+        args.n_lidar_sensors = len(BLIND_LIDARS)
+        print(f"[Blind] per-lidar cameras for sources "
+              f"{[sid for sid, _ in BLIND_LIDARS]} (skip a source when a frame has no points)")
 
     for frame_idx in tqdm(range(frames), desc="Reading GacrtInfo"):
         pose_info = poses[frame_idx]
@@ -372,90 +863,125 @@ def readGacrtInfo(args):
             print(f"[Warning] Point cloud not found: {full_lidar_path}, skipping frame {frame_idx}")
             continue
 
-        # GACRT format: 5 features per point (x, y, z, intensity, ring_idx)
-        points_raw = np.fromfile(full_lidar_path, dtype=np.float32)
-        points_raw = points_raw.reshape(-1, n_feats)
-
-        # Validate point cloud feature count matches expected
-        assert points_raw.shape[1] == n_feats, \
-            f"Point cloud feature count mismatch: expected {n_feats}, got {points_raw.shape[1]}"
-
-        points = points_raw[:, :3]  # x, y, z
-        intensity = points_raw[:, 3]  # intensity
+        points, intensity, source = load_lidar_xyz_intensity(
+            full_lidar_path, n_feats, return_source=True)
         # Normalize intensity to [0, 1] — GACRT raw range is [0, 255],
         # but Gaussian model uses sigmoid activation which outputs [0, 1].
         # Without normalization, the L1 loss compares [0,255] vs [0,1] directly.
         intensity = intensity / 255.0
-        # ring_idx = points_raw[:, 4]  # not used in GS-LiDAR
 
-        # Remove ego vehicle points (close to origin)
-        # GACRT uses ego coordinate frame, so ego vehicle is at origin
-        condition = np.linalg.norm(points, axis=1) > 2.5
-        points = points[condition]
-        intensity = intensity[condition]
+        if blind_origins:
+            t = time_duration[0] + (time_duration[1] - time_duration[0]) * frame_idx / max(frames - 1, 1)
+            (blind_cams, init_points, n_body, n_sup,
+             body_imu, body_imu_i) = build_blind_frame_cameras(
+                points, intensity, source, lidar2global, blind_extrinsics, args,
+                frame_idx, frames, t, lidar_path)
+            n_body_total += n_body
+            if body_imu is not None and len(body_imu):
+                body_imu_chunks.append(body_imu)
+                body_imu_inten_chunks.append(body_imu_i)
+            if len(init_points) == 0 and not blind_cams:
+                print(f"[Warning] No blind-lidar points: {full_lidar_path}, skipping frame {frame_idx}")
+                if debug_cuda and frame_idx >= 15:
+                    break
+                continue
+            if len(init_points):
+                n_input_total += int(init_points.shape[0])
+                n_supervise_total += int(n_sup)
+                point_list.append(init_points)
+                points_time.append(np.full((len(init_points), 1), t, dtype=np.float32))
+                points_is_dynamic.append(np.zeros((len(init_points), 1), dtype=np.float32))
+                points_obj_velocity.append(np.zeros((len(init_points), 3), dtype=np.float32))
+            cam_infos.extend(blind_cams)
+            if debug_cuda and frame_idx >= 15:
+                break
+            continue
 
-        # Transform points to world coordinates: p_world = p_ego @ lidar2global.T
+        points, intensity, input_mask, n_body, _source = filter_lidar_sources(
+            points, intensity, source, args)
+        n_body_total += n_body
+        if points.shape[0] == 0 or not input_mask.any():
+            print(f"[Warning] No usable points after source/body filter: {full_lidar_path}, "
+                  f"skipping frame {frame_idx}")
+            continue
+
+        # Transform points to world coordinates: p_world = p_ego/imu @ lidar2global.T
         points_homo = np.concatenate([points, np.ones_like(points[:, :1])], axis=-1)
-        # lidar2global_ = np.linalg.inv(LIDAR2EGO) @ lidar2global
         points = (points_homo @ lidar2global.T)[:, :3]
-        point_list.append(points)
+        init_points = points[input_mask]
+        init_intensity = intensity[input_mask]
+        n_input_total += int(init_points.shape[0])
+        n_supervise_total += int(points.shape[0])
+        point_list.append(init_points)
 
-        # --- OD: mark dynamic points and assign init velocity ---
-        n_pts = points.shape[0]
+        # --- OD: mark dynamic points and assign init velocity (on training-input points) ---
+        n_pts = init_points.shape[0]
         is_dynamic_frame = np.zeros((n_pts, 1), dtype=np.float32)
         init_velocity_frame = np.zeros((n_pts, 3), dtype=np.float32)
+        is_dynamic_all = np.zeros((points.shape[0], 1), dtype=np.float32)
 
         if use_od_labels and od_annotations_by_path:
-            # Look up per-frame OD by lidar_path (sweep has its own annotations)
-            frame_lidar_path = pose_info.get("lidar_path")
-            if frame_lidar_path is None and "idx" in pose_info:
-                pkl_item = pkl_data[pose_info["idx"]]
-                frame_lidar_path = pkl_item["lidar_points"]["lidar_path"]
-            annotations = od_annotations_by_path.get(frame_lidar_path, [])
+            annotations = od_annotations_by_path.get(lidar_path, [])
 
             if annotations:
-                # Collect world-frame bboxes for moving objects only
                 bboxes = [bbox for _, bbox in annotations]
                 obj_id_list = [oid for oid, _ in annotations]
 
-                # Test points against bboxes
-                obj_ids_per_point, _ = points_in_rotated_3d_bbox(points, bboxes)
-
-                # Mark points inside moving bboxes as dynamic
+                obj_ids_per_point, _ = points_in_rotated_3d_bbox(init_points, bboxes)
                 dynamic_mask = obj_ids_per_point >= 0
                 is_dynamic_frame[dynamic_mask] = 1.0
 
-                # Assign init velocity from tracked object velocity
+                obj_ids_all, _ = points_in_rotated_3d_bbox(points, bboxes)
+                is_dynamic_all[obj_ids_all >= 0] = 1.0
+
                 if getattr(args, 'od_velocity_init', True):
                     for local_idx, obj_id in enumerate(obj_id_list):
                         if obj_id in obj_velocities:
                             point_mask = obj_ids_per_point == local_idx
                             init_velocity_frame[point_mask] = obj_velocities[obj_id]
-        # global_lidar_points = (points_homo @ lidar2global.T)[:, :3]
         points_is_dynamic.append(is_dynamic_frame)
         points_obj_velocity.append(init_velocity_frame)
 
         # Timestamp for dynamic scene: linearly map frame index to time_duration
         t = time_duration[0] + (time_duration[1] - time_duration[0]) * frame_idx / max(frames - 1, 1)
-        point_time = np.full_like(points[:, :1], t)
+        point_time = np.full_like(init_points[:, :1], t)
         points_time.append(point_time)
 
         idx = frame_idx
 
-        # World-to-lidar (camera) transform
-        # KITTI-360 convention: R is stored transposed (for glm in CUDA)
-        w2l = np.array([0, -1, 0, 0,
-                        0, 0, -1, 0,
-                        1, 0, 0, 0,
-                        0, 0, 0, 1]).reshape(4, 4) @ np.linalg.inv(LIDAR2EGO) @ np.linalg.inv(lidar2global)
+        # World → body/ego/IMU (via lidar2ego; identity when cloud already in that frame)
+        # then body → GS panoramic camera axes. R stored transposed for glm/CUDA.
+        w2l = BODY_TO_RV @ np.linalg.inv(lidar2ego) @ np.linalg.inv(lidar2global)
         R = np.transpose(w2l[:3, :3])
         T = w2l[:3, 3]
         points_cam = points @ R + T
+        points_cam_input = init_points @ R + T
+
+        # Physical RV strip: drop moving-object points so they never enter pts_depth.
+        if getattr(args, 'od_mask_gt_loss', False) and is_dynamic_all.any():
+            static_sel = is_dynamic_all[:, 0] < 0.5
+            points_cam_rv = points_cam[static_sel]
+            intensity_rv = intensity[static_sel]
+        else:
+            points_cam_rv = points_cam
+            intensity_rv = intensity
+        if getattr(args, 'od_mask_gt_loss', False) and is_dynamic_frame.any():
+            static_in = is_dynamic_frame[:, 0] < 0.5
+            points_cam_in = points_cam_input[static_in]
+            intensity_in = init_intensity[static_in]
+        else:
+            points_cam_in = points_cam_input
+            intensity_in = init_intensity
+        if parse_input_lidar_sources(args) is None:
+            points_cam_in = None
+            intensity_in = None
 
         # Forward half (front 180 degrees)
         cam_infos.append(CameraInfo(uid=idx, R=R, T=T,
-                                    timestamp=t, pointcloud_camera=points_cam, intensity=intensity,
-                                    towards='forward'))
+                                    timestamp=t, pointcloud_camera=points_cam_rv, intensity=intensity_rv,
+                                    towards='forward', lidar_path=lidar_path,
+                                    pointcloud_camera_input=points_cam_in, intensity_input=intensity_in,
+                                    sensor_id=0, frame_idx=frame_idx))
 
         # Backward half (back 180 degrees)
         R_back = R @ np.array([-1, 0, 0,
@@ -463,22 +989,55 @@ def readGacrtInfo(args):
                                0, 0, -1]).reshape(3, 3)
         T_back = T * np.array([-1, 1, -1])
         points_cam_back = points @ R_back + T_back
+        points_cam_back_in = init_points @ R_back + T_back
+        if getattr(args, 'od_mask_gt_loss', False) and is_dynamic_all.any():
+            points_cam_back = points_cam_back[static_sel]
+        if getattr(args, 'od_mask_gt_loss', False) and is_dynamic_frame.any():
+            points_cam_back_in = points_cam_back_in[static_in]
+        if parse_input_lidar_sources(args) is None:
+            points_cam_back_in = None
         cam_infos.append(CameraInfo(uid=idx + frames, R=R_back, T=T_back,
-                                    timestamp=t, pointcloud_camera=points_cam_back, intensity=intensity,
-                                    towards='backward'))
+                                    timestamp=t, pointcloud_camera=points_cam_back, intensity=intensity_rv,
+                                    towards='backward', lidar_path=lidar_path,
+                                    pointcloud_camera_input=points_cam_back_in, intensity_input=intensity_in,
+                                    sensor_id=0, frame_idx=frame_idx))
 
         if debug_cuda and frame_idx >= 15:
             break
 
+    if parse_input_lidar_sources(args) is not None or getattr(args, "ego_body_aabb", None) is not None:
+        n_frames_kept = max(len(point_list), 1)
+        print(f"[LiDAR source] input_source={parse_input_lidar_sources(args)} "
+              f"init_pts={n_input_total} supervise_pts={n_supervise_total} "
+              f"ego_body_removed={n_body_total} "
+              f"(avg body/frame={n_body_total / n_frames_kept:.1f})")
+
+    if body_imu_chunks:
+        from utils.ego_body_mask import save_ego_body_cloud
+        body_xyz = np.concatenate(body_imu_chunks, axis=0)
+        body_i = np.concatenate(body_imu_inten_chunks, axis=0)
+        body_path = os.path.join(args.model_path, "ego_body_imu.npz")
+        save_ego_body_cloud(body_path, body_xyz, body_i)
+        print(f"[Ego body] saved rigid template {body_path} n={len(body_xyz)}")
+
     if len(point_list) == 0:
-        raise RuntimeError("No point cloud files found! Please check that raw .bin files exist.")
+        raise RuntimeError("No point cloud files found! Please check that raw .bin/.pcd files exist.")
 
     pointcloud = np.concatenate(point_list, axis=0)
     assert pointcloud.shape[0] > 0, \
-        "Concatenated point cloud is empty — all .bin files may have been skipped"
+        "Concatenated point cloud is empty — all .bin/.pcd files may have been skipped"
     pointcloud_timestamp = np.concatenate(points_time, axis=0)
     pointcloud_is_dynamic = np.concatenate(points_is_dynamic, axis=0)
     pointcloud_init_velocity = np.concatenate(points_obj_velocity, axis=0)
+
+    if getattr(args, 'od_mask_init', False):
+        static_sel = pointcloud_is_dynamic[:, 0] < 0.5
+        n_before = pointcloud.shape[0]
+        pointcloud = pointcloud[static_sel]
+        pointcloud_timestamp = pointcloud_timestamp[static_sel]
+        pointcloud_is_dynamic = pointcloud_is_dynamic[static_sel]
+        pointcloud_init_velocity = pointcloud_init_velocity[static_sel]
+        print(f"[OD] od_mask_init: kept {pointcloud.shape[0]}/{n_before} static init points")
 
     num_pts = min(num_pts, pointcloud.shape[0])
     indices = np.random.choice(pointcloud.shape[0], num_pts, replace=False)
@@ -501,17 +1060,19 @@ def readGacrtInfo(args):
     w2cs[:, 3, 3] = 1
     c2ws = unpad_poses(np.linalg.inv(w2cs))
 
-    if not args.test_only:
-        c2ws, transform, scale_factor = transform_poses_pca(c2ws, args.dynamic)
-        np.savez(os.path.join(args.model_path, 'transform_poses_pca.npz'),
-                 transform=transform, scale_factor=scale_factor)
-        c2ws = pad_poses(c2ws)
-    else:
-        data_npz = np.load(os.path.join(args.model_path, 'transform_poses_pca.npz'))
+    pca_path = os.path.join(args.model_path, 'transform_poses_pca.npz')
+    reuse_pca = args.test_only or getattr(args, 'start_checkpoint', None) or os.path.exists(pca_path)
+    if reuse_pca and os.path.exists(pca_path):
+        data_npz = np.load(pca_path)
         transform = data_npz['transform']
         scale_factor = data_npz['scale_factor'].item()
         c2ws = np.diag(np.array([1 / scale_factor] * 3 + [1])) @ transform @ pad_poses(c2ws)
         c2ws[:, :3, 3] *= scale_factor
+        print(f"[PCA] Reused existing transform from {pca_path} (scale_factor={scale_factor})")
+    else:
+        c2ws, transform, scale_factor = transform_poses_pca(c2ws, args.dynamic)
+        np.savez(pca_path, transform=transform, scale_factor=scale_factor)
+        c2ws = pad_poses(c2ws)
 
     for idx, cam_info in enumerate(cam_infos):
         c2w = c2ws[idx]
@@ -519,6 +1080,10 @@ def readGacrtInfo(args):
         cam_info.R[:] = np.transpose(w2c[:3, :3])
         cam_info.T[:] = w2c[:3, 3]
         cam_info.pointcloud_camera[:] *= scale_factor
+        if cam_info.pointcloud_camera_input is not None:
+            cam_info.pointcloud_camera_input[:] *= scale_factor
+        if cam_info.ego_body_points_cam is not None and len(cam_info.ego_body_points_cam):
+            cam_info.ego_body_points_cam[:] *= scale_factor
 
     pointcloud = (np.pad(pointcloud, ((0, 0), (0, 1)), constant_values=1) @ transform.T)[:, :3]
     # Transform init_velocity to PCA-aligned coordinate system (rotation only)
@@ -526,14 +1091,51 @@ def readGacrtInfo(args):
         pointcloud_init_velocity = pointcloud_init_velocity @ transform[:3, :3].T
     args.scale_factor = float(scale_factor)
 
-    mod = args.cam_num  # 2 for forward/backward
+    od_mask_gt_loss = getattr(args, 'od_mask_gt_loss', False)
+    od_bbox_scale = getattr(args, 'od_bbox_scale', 1.15)
+    if od_mask_gt_loss and od_annotations_by_path:
+        h_base, w_base = args.hw[0], args.hw[1]
+        updated_cam_infos = []
+        for cam_info in cam_infos:
+            lp = cam_info.lidar_path
+            raw_bboxes = [b for _, b in od_annotations_by_path.get(lp, [])]
+            bboxes_pca = transform_bboxes_pca(raw_bboxes, transform, scale_factor)
+            od_mask = build_od_loss_mask(
+                cam_info.R, cam_info.T, bboxes_pca,
+                h_base, w_base, args.vfov, args.hfov, od_bbox_scale,
+            )
+            updated_cam_infos.append(cam_info._replace(od_loss_mask=od_mask))
+        cam_infos = updated_cam_infos
+        coverages = [float(1.0 - m.mean()) for m in (c.od_loss_mask for c in cam_infos)]
+        mean_cov = float(np.mean(coverages)) if coverages else 0.0
+        max_cov = float(np.max(coverages)) if coverages else 0.0
+        print(f"[OD] od_mask_gt_loss: stripped dynamic points from RV + "
+              f"filled silhouette masks for {len(cam_infos)} camera views "
+              f"(OD coverage mean={mean_cov:.2%} max={max_cov:.2%})")
+        if mean_cov > 0.40:
+            print("[OD] WARNING: OD silhouette covers >40% of the RV. "
+                  "Check bbox PCA transform / od_min_speed; supervision is nearly empty.")
 
-    # Validate forward/backward camera pairing integrity
+    mod = args.cam_num  # 1 = single 180° half; 2 = forward/backward stitch
+
+    # Validate camera list length against cam_num (pairing for cam_num>=2)
     assert len(cam_infos) % mod == 0, \
         f"cam_infos length {len(cam_infos)} not divisible by cam_num={mod}, forward/backward pairing broken"
 
     # val_frame_ids stores local frame indices
-    if eval_mode:
+    if blind_origins:
+        train_cam_infos = [c for c in cam_infos if c.frame_idx not in val_frame_ids]
+        test_cam_infos = [c for c in cam_infos if c.frame_idx in val_frame_ids]
+        from utils.blind_dead_mask import dead_mask_enabled, build_dead_masks, attach_dead_masks
+        if dead_mask_enabled(args):
+            # Statistics from train frames only; the mask is a sensor property shared with test.
+            dead, ignore = build_dead_masks(train_cam_infos, args)
+            train_cam_infos = attach_dead_masks(train_cam_infos, dead, ignore)
+            test_cam_infos = attach_dead_masks(test_cam_infos, dead, ignore)
+        present = sorted({c.sensor_id for c in cam_infos})
+        print(f"[Blind] cameras={len(cam_infos)} sensor_slots={present} "
+              f"train={len(train_cam_infos)} test={len(test_cam_infos)}")
+    elif eval_mode:
         train_cam_infos = [c for i, c in enumerate(cam_infos)
                            if (i // mod) not in val_frame_ids]
         test_cam_infos = [c for i, c in enumerate(cam_infos)

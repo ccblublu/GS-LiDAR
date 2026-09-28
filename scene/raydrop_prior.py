@@ -3,9 +3,9 @@ import torch.nn.functional as F
 from utils.general_utils import inverse_sigmoid
 
 class RayDropPrior(torch.nn.Module):
-    def __init__(self, h, w):
+    def __init__(self, h, w, n_sensors=1):
         super().__init__()
-        init = inverse_sigmoid(0.1 * torch.ones([1, h, w * 2]))
+        init = inverse_sigmoid(0.1 * torch.ones([int(n_sensors), h, w * 2]))
         self.lidar_raydrop_prior = torch.nn.Parameter(init, requires_grad=True)
         self.lr = None
 
@@ -26,17 +26,19 @@ class RayDropPrior(torch.nn.Module):
             self.lr = training_args.raydrop_prior_lr
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, eps=1e-15)
 
-    def forward(self, towards):
-        w = self.lidar_raydrop_prior.shape[-1] // 2
+    def forward(self, towards, sensor_id=0):
+        prior = self.lidar_raydrop_prior[int(sensor_id)].unsqueeze(0)
+        w = prior.shape[-1] // 2
         if towards == "forward":
-            lidar_raydrop_prior_from_envmap = self.lidar_raydrop_prior[:, :, :w]
+            lidar_raydrop_prior_from_envmap = prior[:, :, :w]
         elif towards == "backward":
-            lidar_raydrop_prior_from_envmap = self.lidar_raydrop_prior[:, :, w:]
+            lidar_raydrop_prior_from_envmap = prior[:, :, w:]
         else:
             raise NotImplementedError(towards)
         return torch.sigmoid(lidar_raydrop_prior_from_envmap)
 
     def upscale(self, h, w):
-        self.lidar_raydrop_prior = torch.nn.Parameter(F.interpolate(self.lidar_raydrop_prior[None], size=(h, w * 2),
-                                                                    mode='bilinear', align_corners=True)[0])
+        up = F.interpolate(self.lidar_raydrop_prior.unsqueeze(0), size=(h, w * 2),
+                           mode='bilinear', align_corners=True)[0]
+        self.lidar_raydrop_prior = torch.nn.Parameter(up)
         self.training_setup(None)

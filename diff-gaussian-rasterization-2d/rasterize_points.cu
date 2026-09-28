@@ -59,7 +59,8 @@ RasterizeGaussiansCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3)
 	{
@@ -133,7 +134,8 @@ RasterizeGaussiansCUDA(
 			vfov_max,
 			hfov_min,
 			hfov_max,
-			scale_factor);
+			scale_factor,
+			near_dist);
 	}
 	return std::make_tuple(rendered, out_contrib, out_color, out_feature, out_depth, out_T, radii, geomBuffer, binningBuffer, imgBuffer);
 }
@@ -170,7 +172,8 @@ RasterizeGaussiansBackwardCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	const int P = means3D.size(0);
 	const int S = features.size(1);
@@ -239,7 +242,8 @@ RasterizeGaussiansBackwardCUDA(
 											 vfov_max,
 											 hfov_min,
 											 hfov_max,
-											 scale_factor);
+											 scale_factor,
+											 near_dist);
 	}
 
 	return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dfeatures, dL_dopacity, dL_dmeans3D, dL_dcov3D,

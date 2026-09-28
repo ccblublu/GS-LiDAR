@@ -26,10 +26,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-LIDAR2EGO = np.array([[ -0.0290051,   -0.999232,   0.0266734,     1.10341 ],
-                [ 0.999562,  -0.0291982, -0.00689323,  0.00806815 ],
-                [ 0.00766665,   0.0264612,    0.999621,     1.93886 ],
-                [ 0.0, 0.0, 0.0, 1.0 ]])
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from scene.gacrt_loader import get_lidar2ego, load_lidar_xyz_intensity
 # ─── 工具函数 ────────────────────────────────────────────────
 
 class VerifyResult:
@@ -262,7 +263,7 @@ def verify_level_1(conf, output_dir):
     report.add("hw 配置", "pass",
                value=f"[{hw[0]}, {hw[1]}] (H=通道数, W=半全景宽度)")
 
-    # 9. 点云文件可访问性
+    # 9. 点云文件可访问性（.bin 或 .pcd）
     missing_bins = 0
     total_bins = len(frames)
     bad_shapes = 0
@@ -273,31 +274,34 @@ def verify_level_1(conf, output_dir):
             missing_bins += 1
             continue
         full_path = os.path.join(source_path, lidar_path)
-        if not os.path.exists(full_path):
+        if not os.path.lexists(full_path) and not os.path.exists(full_path):
             missing_bins += 1
             continue
-        # 文件大小 > 0
+        if os.path.islink(full_path) and not os.path.exists(full_path):
+            missing_bins += 1
+            continue
         file_size = os.path.getsize(full_path)
         if file_size == 0:
             bad_shapes += 1
             continue
-        # reshape 检查
+        if full_path.lower().endswith(".pcd"):
+            continue
         if file_size % (4 * n_feats) != 0:
             bad_shapes += 1
 
     if missing_bins == 0:
-        report.add(".bin 文件可访问", "pass",
+        report.add("点云文件可访问", "pass",
                    value=f"{total_bins}/{total_bins} 存在")
     else:
-        report.add(".bin 文件可访问", "fail",
+        report.add("点云文件可访问", "fail",
                    value=f"{missing_bins}/{total_bins} 缺失")
 
     if bad_shapes == 0:
-        report.add(".bin reshape 检查", "pass",
-                   value=f"所有文件 reshape 为 (N, n_feats) 成功")
+        report.add("点云格式检查", "pass",
+                   value="所有 .bin/.pcd 文件可读取")
     else:
-        report.add(".bin reshape 检查", "fail",
-                   value=f"{bad_shapes} 文件 reshape 失败")
+        report.add("点云格式检查", "fail",
+                   value=f"{bad_shapes} 文件格式异常")
 
     # 10. PKL 文件（如启用 OD）
     pkl_path = getattr(conf, 'pkl_path', None)
@@ -331,6 +335,7 @@ def verify_level_2(conf, output_dir, num_sample_frames=5):
     vfov = list(conf.vfov)
     hfov = list(conf.hfov)
     hw = list(conf.hw)
+    lidar2ego = get_lidar2ego(conf)
 
     # 加载 JSON
     json_path = os.path.join(source_path, sequence_id,
@@ -388,16 +393,12 @@ def verify_level_2(conf, output_dir, num_sample_frames=5):
             all_points_valid = False
             continue
 
-        points_raw = np.fromfile(full_path,
-                                 dtype=np.float32).reshape(-1, n_feats)
-        points = points_raw[:, :3]
-        intensity = points_raw[:, 3]
-
-        # 特征数验证
-        if points_raw.shape[1] != n_feats:
-            report.add(f"帧 {idx} 特征数",
-                       "fail",
-                       value=f"期望 {n_feats}, 实际 {points_raw.shape[1]}")
+        try:
+            points, intensity = load_lidar_xyz_intensity(full_path, n_feats)
+        except Exception as e:
+            report.add(f"帧 {idx} 点云加载", "fail", str(e))
+            all_points_valid = False
+            continue
 
         # 坐标范围
         x_range = (points[:, 0].min(), points[:, 0].max())
@@ -433,7 +434,7 @@ def verify_level_2(conf, output_dir, num_sample_frames=5):
         # 世界坐标 → 相机坐标 (注意: 必须用 world 坐标系的点，与 gacrt_loader 一致)
         w2l = np.array([[0, -1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [
             0, 0, 0, 1
-        ]]) @ np.linalg.inv(LIDAR2EGO) @ np.linalg.inv(lidar2global)
+        ]]) @ np.linalg.inv(lidar2ego) @ np.linalg.inv(lidar2global)
         R = np.transpose(w2l[:3, :3])
         # R = np.array([[-1, 0, 0], [0, 1, 0], [0, 0, 1]]) @ R
         T = w2l[:3, 3]
@@ -513,8 +514,9 @@ def verify_level_2(conf, output_dir, num_sample_frames=5):
             dynamic_labels = set(
                 getattr(conf, 'od_dynamic_labels', [0, 1, 2, 5, 7]))
             min_disp = getattr(conf, 'od_min_displacement', 0.5)
+            min_speed = getattr(conf, 'od_min_speed', None)
             moving_ids, obj_velocities = identify_moving_objects(
-                pkl_data, dynamic_labels, min_disp)
+                pkl_data, dynamic_labels, min_disp, min_speed=min_speed)
             report.add("OD 移动目标识别", "pass", value=f"{len(moving_ids)} 个移动目标")
             report.add("OD 速度估计",
                        "pass",

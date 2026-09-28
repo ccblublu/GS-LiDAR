@@ -203,6 +203,7 @@ __global__ void preprocessCUDA(
 	const float hfov_min,
 	const float hfov_max,
 	const float scale_factor,
+	const float near_dist,
 	float *transMats)
 {
 	auto idx = cg::this_grid().thread_rank();
@@ -228,7 +229,7 @@ __global__ void preprocessCUDA(
 	// 计算全景图对应的极坐标&cov
 	float3 mean3D_panorama = computePanoramaCoordinate(p_orig, viewmatrix); // theta phi r
 
-	if (!(mask[idx]) || !in_frustum_panorama(mean3D_panorama, VFOV_min, VFOV_max, HFOV_min, HFOV_max, scale_factor))
+	if (!(mask[idx]) || !in_frustum_panorama(mean3D_panorama, VFOV_min, VFOV_max, HFOV_min, HFOV_max, scale_factor, near_dist))
 		return;
 
 	// 2d gaussian
@@ -311,7 +312,8 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
-		const float scale_factor)
+		const float scale_factor,
+		const float near_dist)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -363,7 +365,9 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	const float HFOV_max = hfov_max * MY_PI / 180;
 	const float HFOV_min = hfov_min * MY_PI / 180;
 
-	const float near = near_n * scale_factor;
+	const float near = near_dist * scale_factor;
+	// Distortion keeps the fixed near_n normalization; closer depths clamp to it.
+	const float near_distortion = near_n * scale_factor;
 	const float far = far_n * scale_factor;
 
 	// Iterate over batches until all done or range is complete
@@ -450,7 +454,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
 			float A = 1 - T;
-			float m = far / (far - near) * (1 - near / depth);
+			float m = far / (far - near_distortion) * (1 - near_distortion / max(depth, near_distortion));
 			distortion += (m * m * A + M2 - 2 * m * M1) * w;
 			M1 += m * w;
 			M2 += m * m * w;
@@ -525,7 +529,8 @@ void FORWARD::render(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
-	const float scale_factor)
+	const float scale_factor,
+	const float near_dist)
 {
 	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
 		ranges,
@@ -547,7 +552,8 @@ void FORWARD::render(
 		vfov_max,
 		hfov_min,
 		hfov_max,
-		scale_factor);
+		scale_factor,
+		near_dist);
 }
 
 void FORWARD::preprocess(
@@ -582,6 +588,7 @@ void FORWARD::preprocess(
 	const float hfov_min,
 	const float hfov_max,
 	const float scale_factor,
+	const float near_dist,
 	float *transMats)
 {
 	preprocessCUDA<NUM_CHANNELS><<<(P + 255) / 256, 256>>>(
@@ -616,5 +623,6 @@ void FORWARD::preprocess(
 		hfov_min,
 		hfov_max,
 		scale_factor,
+		near_dist,
 		transMats);
 }

@@ -12,7 +12,9 @@ scene_type: "Gacrt"
 sequence_id: "PCI_20260825"
 keyframes_only: false
 
-resolution_scales: [1, 2, 4]
+# No x4 stage: at 112x32 small near-field Gaussians fall under the 0.7 px
+# visibility prune and are deleted before they are ever supervised.
+resolution_scales: [1, 2]
 scale_increase_interval: 5000
 # One 180° half per blind lidar (hfov ±90); no front/back 360 stitch.
 cam_num: 1
@@ -46,7 +48,8 @@ ego_body_aabb:
   - [-1.80, 0.00]
 ego_body_filter_sources: [1, 2, 3, 4]
 ego_body_infer_replace: true
-ego_body_replace_dilate: 2
+# 0: the dilated band cleared ground / pillar bases next to the body silhouette.
+ego_body_replace_dilate: 0
 blind_dead_mask: true
 raster_near: 0.3
 
@@ -66,7 +69,9 @@ lambda_smooth: 1e-3
 lambda_chamfer: 1e-1
 lambda_distortion: 1e-2
 lambda_normal_consistency: 1e-1
-thresh_opa_prune: 0.1
+# Must stay below init/reset opacity (0.05). At 0.1 every Gaussian is prunable
+# after each opacity reset, and sparsely-seen near-field ones never recover.
+thresh_opa_prune: 0.01
 
 test_iterations: [3000, 7000, 15000, 30000, 50000]
 random_init_point: 0

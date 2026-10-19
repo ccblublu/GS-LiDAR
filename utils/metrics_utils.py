@@ -332,15 +332,28 @@ class PointsMeter:
 
         return points_xyz
 
-    def update(self, preds, truths):
-        preds = preds / self.scale
-        truths = truths / self.scale
+    def _clip_points(self, points):
+        points = points / self.scale
+        norm = points.norm(dim=1)
+        return points[(norm > self.near) & (norm <= self.far)]
+
+    def update(self, preds, truths, pred_points=None, gt_points=None):
+        """``pred_points`` / ``gt_points`` (N,3, scaled units) override the uniform
+        pano back-projection, e.g. ring-RV slots whose rays are not on the grid."""
         # preds, truths = self.prepare_inputs(
         #     preds, truths
         # )  # [B, N, 3] or [B, H, W, 3], range[0, 1]
         chamLoss = chamfer_3DDist()
-        pred_lidar = self.pano_to_lidar(preds[0])
-        gt_lidar = self.pano_to_lidar(truths[0])
+        if pred_points is not None:
+            pred_lidar = self._clip_points(pred_points)
+        else:
+            pred_lidar = self.pano_to_lidar(preds[0] / self.scale)
+        if gt_points is not None:
+            gt_lidar = self._clip_points(gt_points)
+        else:
+            gt_lidar = self.pano_to_lidar(truths[0] / self.scale)
+        if len(pred_lidar) == 0 or len(gt_lidar) == 0:
+            return
         # pred_lidar = self.discard_outliers(pred_lidar, 1.0)
 
         dist1, dist2, idx1, idx2 = chamLoss(pred_lidar[None, ...], gt_lidar[None, ...])

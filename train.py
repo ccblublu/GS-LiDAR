@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import psnr, ssim, inverse_depth_smoothness_loss_mask, tv_loss
-from gaussian_renderer import render, render_range_map
+from gaussian_renderer import render, render_range_map, ring_raydrop_maps, render_ring_range_map
 from scene import Scene, GaussianModel, RayDropPrior
 from utils.general_utils import seed_everything, visualize_depth
 from utils.graphics_utils import pano_to_lidar
@@ -33,6 +33,7 @@ from utils.od_loss_mask import resize_od_mask, stitch_od_mask_pano
 from utils.blind_dead_mask import dead_mask_enabled, get_camera_mask, stitch_camera_mask, force_dead_drop
 from chamfer.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 from scene.unet import UNet
+from utils import ring_rv
 
 EPS = 1e-5
 
@@ -140,7 +141,10 @@ def training(args):
 
     start_w, start_h = scene.getWH()
     n_sensors = int(getattr(args, "n_lidar_sensors", 1) or 1)
-    lidar_raydrop_prior = RayDropPrior(h=start_h, w=start_w, n_sensors=n_sensors).cuda()
+    ring_mode = ring_rv.ring_rv_enabled(args)
+    # Ring RV: the prior lives on ring slots (one row per laser ring).
+    prior_h = ring_rv.n_ring_rows(args) if ring_mode else start_h
+    lidar_raydrop_prior = RayDropPrior(h=prior_h, w=start_w, n_sensors=n_sensors).cuda()
     lidar_raydrop_prior.training_setup(args)
 
     first_iter = 0
@@ -305,7 +309,22 @@ def training(args):
             log_dict['loss_intensity_sh'] = loss_intensity_sh.item()
             loss += args.lambda_intensity_sh * loss_intensity_sh
 
-        if args.lambda_raydrop > 0:
+        ring_raydrop = None
+        if args.lambda_raydrop > 0 and ring_mode:
+            # Raydrop on ring slots: labels are "fired but no return", not grid cells the
+            # sensor never fires into. Geometry losses stay on the uniform grid.
+            _, _, ring_raydrop, ring_geom = ring_raydrop_maps(
+                args, viewpoint_cam, depth, intensity_sh_map, raydrop_map,
+                render_pkg["depth_mean"], lidar_raydrop_prior)
+            ring_gt_raydrop = (viewpoint_cam.ring_depth.cuda() <= 0).float()
+            ring_valid = ring_rv.camera_ring_valid(viewpoint_cam, ring_geom, ring_raydrop.device)
+            if ring_valid.any():
+                loss_raydrop = F.binary_cross_entropy(ring_raydrop[ring_valid], ring_gt_raydrop[ring_valid])
+            else:
+                loss_raydrop = torch.zeros((), device=ring_raydrop.device)
+            log_dict['loss_raydrop'] = loss_raydrop.item()
+            loss += args.lambda_raydrop * loss_raydrop
+        elif args.lambda_raydrop > 0:
             pts_depth = viewpoint_cam.pts_depth.cuda()
             # Hits = training-input returns (top-only when pts_depth_input is set).
             # OD silhouette and ego-body pixels are unsupervised, not "must drop".
@@ -488,7 +507,14 @@ def training(args):
                 v_color = visualize_depth(v_norm_map, near=0.01, far=1)
                 other_img.append(v_color)
 
-                if args.lambda_raydrop > 0:
+                if args.lambda_raydrop > 0 and ring_raydrop is not None:
+                    # Ring RV is (R, W); show it at the grid size so the panels tile.
+                    ring_gt_vis = ring_gt_raydrop * ring_rv.camera_ring_valid(
+                        viewpoint_cam, ring_geom, ring_gt_raydrop.device)
+                    for m in (ring_raydrop.detach(), ring_gt_vis):
+                        m = F.interpolate(m[None], size=depth.shape[-2:], mode="nearest")[0]
+                        other_img.append(visualize_depth(m, near=0.01, far=1))
+                elif args.lambda_raydrop > 0:
                     raydrop_map = render_pkg['raydrop']
                     raydrop_map = visualize_depth(raydrop_map, near=0.01, far=1)
                     other_img.append(raydrop_map)
@@ -535,7 +561,7 @@ def training(args):
             if iteration % args.scale_increase_interval == 0:
                 scene.upScale()
                 next_w, next_h = scene.getWH()
-                lidar_raydrop_prior.upscale(next_h, next_w)
+                lidar_raydrop_prior.upscale(prior_h if ring_mode else next_h, next_w)
 
     if conf_trackers:
         conf_out = {}
@@ -547,6 +573,8 @@ def training(args):
     return
 
 def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderArgs, log_dict, env_map=None):
+    if ring_rv.ring_rv_enabled(args):
+        return complete_eval_ring(iteration, test_iterations, scene, renderFunc, renderArgs, env_map)
     if iteration in test_iterations or iteration == 1:
         scale = scene.resolution_scales[scene.scale_index]
         if iteration < args.iterations:
@@ -723,6 +751,161 @@ def complete_eval(iteration, test_iterations, scene: Scene, renderFunc, renderAr
         torch.cuda.empty_cache()
 
 
+RING_META = "ring_meta.json"
+
+
+def ring_hole_stats(pred_depth, gt_depth, fired):
+    """Hole rates over fired slots only; placeholder columns are not holes."""
+    pred_hit = (pred_depth > 0) & fired
+    gt_hit = (gt_depth > 0) & fired
+    return {
+        "static_miss": float(((gt_hit & ~pred_hit).float().sum() / gt_hit.float().sum().clamp_min(1)).item()),
+        "pred_empty": float(((~pred_hit & fired).float().sum() / fired.float().sum().clamp_min(1)).item()),
+    }
+
+
+def complete_eval_ring(iteration, test_iterations, scene: Scene, renderFunc, renderArgs, env_map=None):
+    """complete_eval for the ring RV: raydrop / depth metrics on ring slots, point
+    clouds from slot rays vs. the uniform-grid GT cloud."""
+    if not (iteration in test_iterations or iteration == 1):
+        return
+    scale = scene.resolution_scales[scene.scale_index]
+    if iteration < args.iterations:
+        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras(scale=scale)},)
+    else:
+        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras(scale=scale)},
+                              {'name': 'train', 'cameras': scene.getTrainCameras()})
+    h, w = args.hw[0] // scale, args.hw[1] // scale
+    savedir = os.path.join(args.model_path, "ray_drop_datasets")
+    dead_on = dead_mask_enabled(args)
+    meta = {}
+
+    for config in validation_configs:
+        cams = config['cameras']
+        if not cams:
+            continue
+        metrics = [RaydropMeter(), IntensityMeter(scale=1), DepthMeter(scale=args.scale_factor),
+                   PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=args.hfov),
+                   PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=args.hfov),
+                   PointsMeter(scale=args.scale_factor, vfov=args.vfov, hfov=args.hfov)]
+        outdir = os.path.join(args.model_path, "eval", config['name'] + f"_{iteration}" + "_render")
+        os.makedirs(outdir, exist_ok=True)
+        hole_stats = []
+        for cam in cams:
+            depth, intensity, raydrop, gt_depth, gt_intensity, geom = render_ring_range_map(
+                args, cam, scene.gaussians, renderFunc, renderArgs, env_map)
+            device = depth.device
+            slot = geom.slot_valid.to(device) > 0.5
+            valid = ring_rv.camera_ring_valid(cam, geom, device)
+            gt_raydrop = (gt_depth <= 0).float()
+            dead = cam.ring_dead_mask.to(device) > 0.5 if (dead_on and cam.ring_dead_mask is not None) \
+                else torch.zeros_like(slot)
+            gt_uniform = cam.pts_depth.to(device)
+
+            if iteration == args.iterations:
+                name = f"{cam.colmap_id:03d}.pt"
+                meta[name] = int(cam.sensor_id)
+                torch.save(torch.cat([raydrop, intensity, depth[[0]]]).cpu(),
+                           os.path.join(savedir, f"render_{config['name']}", name))
+                # gt: [raydrop, intensity, depth, valid slot] on the ring RV.
+                torch.save(torch.cat([gt_raydrop, gt_intensity, gt_depth, valid.float()]).cpu(),
+                           os.path.join(savedir, "gt", name))
+                os.makedirs(os.path.join(savedir, "gt_uniform"), exist_ok=True)
+                torch.save(gt_uniform.cpu(), os.path.join(savedir, "gt_uniform", name))
+                # [always drop (dead zone + unfired placeholders), ignore]
+                ignore = ~valid
+                os.makedirs(os.path.join(savedir, "blind_dead"), exist_ok=True)
+                torch.save(torch.cat([(dead | ~slot).float(), ignore.float()]).cpu(),
+                           os.path.join(savedir, "blind_dead", name))
+                if cam.ring_body_depth is not None and getattr(args, "ego_body_infer_replace", True):
+                    from utils.ego_body_mask import _dilate_mask
+                    clear = cam.ring_body_depth > 0
+                    if cam.ring_ego_mask is not None:
+                        clear = clear | (cam.ring_ego_mask > 0.5)
+                    clear = _dilate_mask(clear, int(getattr(args, "ego_body_replace_dilate", 2) or 0)) \
+                        * geom.slot_valid
+                    os.makedirs(os.path.join(savedir, "ego_body"), exist_ok=True)
+                    torch.save(torch.cat([cam.ring_body_depth, cam.ring_body_intensity, clear]).cpu(),
+                               os.path.join(savedir, "ego_body", name))
+
+            drop_mask = (raydrop > 0.5).float()
+            depth_eval = depth * (1.0 - drop_mask)
+            intensity_eval = intensity * (1.0 - drop_mask)
+            hole_stats.append(ring_hole_stats(depth_eval[[0]], gt_depth, slot & ~dead))
+
+            vis_h = int(args.hw[0]) // scale
+            def up(x):
+                return F.interpolate(x[None].float(), size=(vis_h, x.shape[-1]), mode="nearest")[0]
+            grid = [visualize_depth(up(depth_eval[[0]]), scale_factor=args.scale_factor),
+                    up(intensity_eval.clamp(0.0, 1.0)).repeat(3, 1, 1),
+                    visualize_depth(up(gt_depth), scale_factor=args.scale_factor),
+                    up(gt_intensity.clamp(0.0, 1.0)).repeat(3, 1, 1),
+                    visualize_depth(up(drop_mask * slot), near=0.01, far=1),
+                    visualize_depth(up(gt_raydrop * valid), near=0.01, far=1)]
+            save_image(make_grid(grid, nrow=2), os.path.join(outdir, f"{cam.colmap_id:03d}.png"))
+
+            static_valid = gt_depth > 0
+            gt_points = pano_to_lidar(gt_uniform, args.vfov, args.hfov)
+            metrics[0].update(raydrop, gt_raydrop, valid_mask=valid)
+            metrics[1].update(intensity_eval, gt_intensity, valid_mask=static_valid)
+            metrics[2].update(depth_eval[[0]], gt_depth, valid_mask=static_valid)
+            for i in range(3):
+                metrics[3 + i].update(None, None, pred_points=ring_rv.ring_to_points(depth_eval[[i]], geom),
+                                      gt_points=gt_points)
+
+        RMSE, Acc, F1 = metrics[0].measure()
+        rmse_i, medae_i, lpips_i, ssim_i, psnr_i = metrics[1].measure()
+        rmse_d, medae_d, lpips_d, ssim_d, psnr_d = metrics[2].measure()
+        C_D_mix, F_mix = metrics[3].measure().astype(float)
+        C_D_mean, F_mean = metrics[4].measure().astype(float)
+        C_D_median, F_median = metrics[5].measure().astype(float)
+        payload = {"Ray drop": {"RMSE": RMSE, "Acc": Acc, "F1": F1},
+                   "Point Cloud mix": {"C-D": C_D_mix, "F-score": F_mix},
+                   "Point Cloud mean": {"C-D": C_D_mean, "F-score": F_mean},
+                   "Point Cloud median": {"C-D": C_D_median, "F-score": F_median},
+                   "Depth": {"RMSE": rmse_d, "MedAE": medae_d, "LPIPS": lpips_d, "SSIM": ssim_d, "PSNR": psnr_d},
+                   "Intensity SH": {"RMSE": rmse_i, "MedAE": medae_i, "LPIPS": lpips_i, "SSIM": ssim_i, "PSNR": psnr_i}}
+        holes = {k: float(np.mean([s_[k] for s_ in hole_stats])) for k in hole_stats[0]} if hole_stats else {}
+        with open(os.path.join(outdir, "metrics.json"), "w") as f:
+            json.dump({"split": config['name'], "iteration": iteration, "space": "ring_rv", **payload,
+                       "Holes": holes}, f, indent=1)
+        if training_logger is not None:
+            training_logger.log_eval_metrics(iteration, config['name'], payload)
+
+    if meta:
+        meta_path = os.path.join(savedir, RING_META)
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                meta = {**json.load(f), **meta}
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+    torch.cuda.empty_cache()
+
+
+def ring_geom_for_width(sensor, w):
+    """RingGeometry of the render grid whose width is ``w`` (the saved RV width)."""
+    h = int(args.hw[0]) * int(w) // int(args.hw[1])
+    return ring_rv.get_geometry(args, int(sensor), h, int(w))
+
+
+def ring_refine_side_inputs(names, w, device="cuda"):
+    """Per-sample sensor index and a (n_sensors, 2+n_sensors, R, W) coordinate bank for the UNet."""
+    with open(os.path.join(args.model_path, "ray_drop_datasets", RING_META)) as f:
+        meta = json.load(f)
+    lut = ring_rv.get_ring_lut(args)
+    n_sensors = lut["elev_deg"].shape[0]
+    sensors = torch.tensor([meta[n] for n in names], dtype=torch.long)
+    bank = torch.stack([ring_rv.coord_channels(ring_geom_for_width(s, w), s, n_sensors, device)
+                        for s in range(n_sensors)])
+    return sensors, bank
+
+
+def refine_in_channels():
+    if not ring_rv.ring_rv_enabled(args):
+        return 3
+    return 3 + 2 + ring_rv.get_ring_lut(args)["elev_deg"].shape[0]
+
+
 def refine():
     refine_output_dir = os.path.join(args.model_path, "refine")
     # if os.path.exists(refine_output_dir):
@@ -731,7 +914,7 @@ def refine():
     gt_dir = os.path.join(args.model_path, "ray_drop_datasets", "gt")
     train_dir = os.path.join(args.model_path, "ray_drop_datasets", f"render_train")
 
-    unet = UNet(in_channels=3, out_channels=1)
+    unet = UNet(in_channels=refine_in_channels(), out_channels=1)
     unet.cuda()
     unet.train()
 
@@ -739,7 +922,7 @@ def refine():
     raydrop_gt_list = []
     raydrop_valid_list = []
 
-    train_names = [n for n in os.listdir(train_dir) if n.endswith(".pt")]
+    train_names = sorted(n for n in os.listdir(train_dir) if n.endswith(".pt"))
     if not train_names:
         print(f"Skip refine: no raydrop train tensors in {train_dir}. "
               "Need a last-iteration eval to write ray_drop_datasets.")
@@ -774,6 +957,10 @@ def refine():
     del raydrop_input_list, raydrop_gt_list, raydrop_valid_list
     print(f"Refine stack on CPU: input={tuple(raydrop_input.shape)} "
           f"({raydrop_input.nbytes / 1e9:.2f} GB) + gt/valid")
+    # Ring RV: the UNet also sees slot elevation / azimuth and the sensor id, so a
+    # sensor-fixed pattern (mount occlusion, per-ring behaviour) is learnable.
+    ring_sensors, ring_bank = ring_refine_side_inputs(train_names, raydrop_input.shape[-1]) \
+        if ring_rv.ring_rv_enabled(args) else (None, None)
 
     loss_total = []
 
@@ -793,10 +980,12 @@ def refine():
             input = raydrop_input[idx, ...].cuda(non_blocking=True)
             gt = raydrop_gt[idx, ...].cuda(non_blocking=True)
             valid = raydrop_valid[idx, ...].cuda(non_blocking=True)
+            side = ring_bank[ring_sensors[idx]] if ring_bank is not None else None
         else:
             input = raydrop_input.cuda()
             gt = raydrop_gt.cuda()
             valid = raydrop_valid.cuda()
+            side = ring_bank[ring_sensors] if ring_bank is not None else None
 
         # random mask
         mask = torch.ones_like(input).to(input.device)
@@ -810,7 +999,10 @@ def refine():
             xi = np.random.randint(input.shape[3] - box_size_x)
             mask[:, :, yi:yi + box_size_y, xi:xi + box_size_x] = 0.
 
-        raydrop_refine = unet(input * mask)
+        net_in = input * mask
+        if side is not None:
+            net_in = torch.cat([net_in, side], dim=1)
+        raydrop_refine = unet(net_in)
         if valid.min() < 1:
             bce_map = torch.nn.functional.binary_cross_entropy(raydrop_refine, gt, reduction='none')
             bce_loss = (bce_map * valid).sum() / valid.sum().clamp_min(1)
@@ -849,6 +1041,27 @@ def refine():
     torch.cuda.empty_cache()
 
 
+def refine_ring_eval(metrics, hole_stats, outdir, name, raydrop, depth, intensity,
+                     gt_raydrop, gt_intensity, gt_depth, raydrop_valid, fired, geom, gt_uniform):
+    """refine_test body for one ring-RV sample (depth / intensity already raydrop-masked)."""
+    static_valid = gt_depth > 0
+    hole_stats.append(ring_hole_stats(depth, gt_depth, fired))
+    grid = [visualize_depth(gt_depth, scale_factor=args.scale_factor),
+            visualize_depth(depth, scale_factor=args.scale_factor),
+            gt_intensity.clamp(0, 1).repeat(3, 1, 1),
+            intensity.clamp(0, 1).repeat(3, 1, 1)]
+    save_image(make_grid(grid, nrow=1, padding=0), os.path.join(outdir, name.replace(".pt", ".png")))
+    pred_points = ring_rv.ring_to_points(depth, geom)
+    gt_points = pano_to_lidar(gt_uniform, args.vfov, args.hfov)
+    save_ply(pred_points, os.path.join(outdir, name.replace(".pt", ".ply")),
+             intensity[0][depth[0] > 0].reshape(-1, 1))
+    save_ply(gt_points, os.path.join(outdir, name.replace(".pt", "_gt.ply")))
+    metrics[0].update(raydrop, gt_raydrop, valid_mask=raydrop_valid)
+    metrics[1].update(intensity, gt_intensity, valid_mask=static_valid)
+    metrics[2].update(depth, gt_depth, valid_mask=static_valid)
+    metrics[3].update(None, None, pred_points=pred_points, gt_points=gt_points)
+
+
 def refine_test():
     refine_test_bs = 32  # reduce if OOM
 
@@ -858,7 +1071,7 @@ def refine_test():
     if not os.path.exists(file_path):
         print(f"Skip refine_test: {file_path} not found.")
         return
-    unet = UNet(in_channels=3, out_channels=1)
+    unet = UNet(in_channels=refine_in_channels(), out_channels=1)
     unet.load_state_dict(torch.load(file_path, map_location="cpu"))
     unet.cuda()
     unet.eval()
@@ -867,6 +1080,7 @@ def refine_test():
     half_only = int(getattr(args, "cam_num", 2) or 2) == 1
     hfov = tuple(args.hfov) if half_only else (-180, 180)
     pm_hfov = tuple(args.hfov) if half_only else None
+    ring_mode = ring_rv.ring_rv_enabled(args)
 
     for mode in ["train", "test"]:
         outdir = os.path.join(args.model_path, "eval", f"{mode}_refine_render")
@@ -875,6 +1089,13 @@ def refine_test():
         test_dir = os.path.join(args.model_path, "ray_drop_datasets", f"render_{mode}")
         gt_dir = os.path.join(args.model_path, "ray_drop_datasets", "gt")
         name_list = sorted(os.listdir(test_dir))
+        if not name_list:
+            print(f"Refine test {mode}: no samples in {test_dir}, skip")
+            continue
+        if ring_mode:
+            w_saved = torch.load(os.path.join(test_dir, name_list[0]), map_location="cpu").shape[-1]
+            ring_sensors, ring_bank = ring_refine_side_inputs(name_list, w_saved)
+            gt_uniform_dir = os.path.join(args.model_path, "ray_drop_datasets", "gt_uniform")
 
         metrics = [
             RaydropMeter(),
@@ -899,7 +1120,11 @@ def refine_test():
                     dim=0,
                 ).cuda(non_blocking=True)
 
-                raydrop_refine = unet(test_input)
+                net_in = test_input
+                if ring_mode:
+                    side = ring_bank[ring_sensors[batch_start:batch_start + len(batch_names)]]
+                    net_in = torch.cat([test_input, side], dim=1)
+                raydrop_refine = unet(net_in)
                 raydrop_mask = torch.where(raydrop_refine > 0.5, 1, 0)
 
                 ego_body_dir = os.path.join(args.model_path, "ray_drop_datasets", "ego_body")
@@ -930,6 +1155,16 @@ def refine_test():
                     gt_raydrop_pano = gt[idx, [0]]
                     gt_intensity_pano = gt[idx, [1]]
                     gt_depth_pano = gt[idx, [2]]
+                    if ring_mode:
+                        # Channel 3 is the raydrop-valid slot mask, not an OD mask.
+                        ring_geom_i = ring_geom_for_width(int(ring_sensors[batch_start + idx]), w_saved)
+                        slot_ok = gt[idx, [3]] > 0.5
+                        fired = dead_pack[[0]] < 0.5 if dead_ok is not None else ring_geom_i.slot_valid.to(gt.device) > 0.5
+                        refine_ring_eval(metrics, hole_stats, outdir, name, raydrop_pano, depth_pano, intensity_pano,
+                                         gt_raydrop_pano, gt_intensity_pano, gt_depth_pano,
+                                         slot_ok if dead_ok is None else (slot_ok & dead_ok), fired, ring_geom_i,
+                                         torch.load(os.path.join(gt_uniform_dir, name), map_location=gt.device))
+                        continue
                     od_valid = gt[idx, [3]] > 0.5 if gt.shape[1] > 3 else None
                     if od_valid is not None:
                         depth_eval = depth_pano * od_valid.float()
@@ -1058,6 +1293,11 @@ if __name__ == "__main__":
         with open(os.path.join(args.model_path, "scale_factor.txt"), 'r') as file:
             data = file.read()
             args.scale_factor = float(data)
+
+    if args_read.refine_only and not args.test_only:
+        # No loader runs: metric scale must come from the training run.
+        with open(os.path.join(args.model_path, "scale_factor.txt"), 'r') as file:
+            args.scale_factor = float(file.read())
 
     if args.debug_cuda:
         args.resolution_scales = [args.resolution_scales[-1]]

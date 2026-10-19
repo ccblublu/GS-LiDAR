@@ -16,6 +16,8 @@ import json
 import pickle
 from collections import defaultdict
 from utils.od_loss_mask import build_od_loss_mask, transform_bboxes_pca
+from utils.ring_rv import (LUT_NAME, ring_rv_enabled, build_ring_lut, save_ring_lut, load_ring_lut,
+                           set_ring_lut, describe_lut, build_ring_dead_masks, attach_ring_dead_masks)
 
 # GACRT014 default; override via config `lidar2ego` for other vehicles.
 DEFAULT_LIDAR2EGO = np.array([[ -0.0290051,   -0.999232,   0.0266734,     1.10341 ],
@@ -172,7 +174,7 @@ def _body_ignore_mask(body_cam, scene_cam, height, width, vfov, hfov):
 
 def build_blind_frame_cameras(
     points_imu, intensity, source, lidar2global, extrinsics, args,
-    frame_idx, n_frames, timestamp, lidar_path,
+    frame_idx, n_frames, timestamp, lidar_path, ring=None,
 ):
     """One camera per blind lidar that has points in this frame.
 
@@ -189,12 +191,17 @@ def build_blind_frame_cameras(
     points_imu = points_imu[finite]
     intensity = intensity[finite]
     source = np.asarray(source)[finite]
+    if ring is None:
+        ring = np.full(len(source), -1, dtype=np.int64)
+    else:
+        ring = np.asarray(ring)[finite]
     near_r = getattr(args, "ego_near_radius", None)
     if near_r is not None and float(near_r) > 0:
         keep = np.linalg.norm(points_imu, axis=1) > float(near_r)
         points_imu = points_imu[keep]
         intensity = intensity[keep]
         source = source[keep]
+        ring = ring[keep]
 
     height, width = int(args.hw[0]), int(args.hw[1])
     aabb = getattr(args, "ego_body_aabb", None)
@@ -211,6 +218,7 @@ def build_blind_frame_cameras(
             continue
         pts = points_imu[selected]
         inten = intensity[selected]
+        rng = ring[selected]
         is_body = points_in_aabb(pts, aabb) if aabb is not None else np.zeros(len(pts), dtype=bool)
         n_body += int(is_body.sum())
         scene_pts = pts[~is_body]
@@ -250,6 +258,7 @@ def build_blind_frame_cameras(
             frame_idx=frame_idx, ego_body_mask=mask_front,
             ego_body_points_cam=body_cam if len(body_cam) else None,
             ego_body_intensity=inten[is_body].astype(np.float32) if np.any(is_body) else None,
+            ring_ids=rng[~is_body], ego_body_ring=rng[is_body] if np.any(is_body) else None,
         ))
         if half_only:
             continue
@@ -267,6 +276,7 @@ def build_blind_frame_cameras(
             frame_idx=frame_idx, ego_body_mask=mask_back,
             ego_body_points_cam=body_cam_back if len(body_cam_back) else None,
             ego_body_intensity=inten[is_body].astype(np.float32) if np.any(is_body) else None,
+            ring_ids=rng[~is_body], ego_body_ring=rng[is_body] if np.any(is_body) else None,
         ))
 
     body_imu_chunks = []
@@ -293,15 +303,16 @@ def build_blind_frame_cameras(
     return cameras, init_world, n_body, n_supervise, body_imu, body_imu_i
 
 
-def load_lidar_xyz_intensity(path, n_feats=5, return_source=False):
+def load_lidar_xyz_intensity(path, n_feats=5, return_source=False, return_ring=False):
     """Load xyz + intensity from a GACRT .bin or binary / binary_compressed .pcd.
 
     .bin: float32 rows of (x, y, z, intensity, ring, ...).
     .pcd: FIELDS must include x, y, z; intensity/source are optional.
     """
     path = str(path)
+    ring = None
     if path.lower().endswith(".pcd"):
-        xyz, intensity, source = _load_pcd_xyz_intensity(path, return_source=True)
+        xyz, intensity, source, ring = _load_pcd_xyz_intensity(path, return_source=True, return_ring=True)
     else:
         points_raw = np.fromfile(path, dtype=np.float32)
         if points_raw.size % n_feats != 0:
@@ -311,6 +322,10 @@ def load_lidar_xyz_intensity(path, n_feats=5, return_source=False):
         xyz = points_raw[:, :3].astype(np.float32)
         intensity = points_raw[:, 3].astype(np.float32)
         source = None
+        if n_feats >= 5:
+            ring = points_raw[:, 4].astype(np.int64)
+    if return_ring:
+        return xyz, intensity, source, ring
     if return_source:
         return xyz, intensity, source
     return xyz, intensity
@@ -329,7 +344,7 @@ def _lzf_decompress(data, expected_size):
     return out
 
 
-def _load_pcd_xyz_intensity(path, return_source=False):
+def _load_pcd_xyz_intensity(path, return_source=False, return_ring=False):
     with open(path, "rb") as f:
         header_lines = []
         while True:
@@ -387,6 +402,9 @@ def _load_pcd_xyz_intensity(path, return_source=False):
     else:
         intensity = np.zeros(len(xyz), dtype=np.float32)
     source = cols["source"].astype(np.int32) if "source" in cols else None
+    if return_ring:
+        ring = cols["ring"].astype(np.int64) if "ring" in cols else None
+        return xyz, intensity, source, ring
     if return_source:
         return xyz, intensity, source
     return xyz, intensity
@@ -863,8 +881,8 @@ def readGacrtInfo(args):
             print(f"[Warning] Point cloud not found: {full_lidar_path}, skipping frame {frame_idx}")
             continue
 
-        points, intensity, source = load_lidar_xyz_intensity(
-            full_lidar_path, n_feats, return_source=True)
+        points, intensity, source, ring = load_lidar_xyz_intensity(
+            full_lidar_path, n_feats, return_ring=True)
         # Normalize intensity to [0, 1] — GACRT raw range is [0, 255],
         # but Gaussian model uses sigmoid activation which outputs [0, 1].
         # Without normalization, the L1 loss compares [0,255] vs [0,1] directly.
@@ -875,7 +893,7 @@ def readGacrtInfo(args):
             (blind_cams, init_points, n_body, n_sup,
              body_imu, body_imu_i) = build_blind_frame_cameras(
                 points, intensity, source, lidar2global, blind_extrinsics, args,
-                frame_idx, frames, t, lidar_path)
+                frame_idx, frames, t, lidar_path, ring=ring)
             n_body_total += n_body
             if body_imu is not None and len(body_imu):
                 body_imu_chunks.append(body_imu)
@@ -1052,6 +1070,23 @@ def readGacrtInfo(args):
               f"{int(pointcloud_is_dynamic.sum())} dynamic ({dynamic_ratio:.2%}), "
               f"{int((1 - pointcloud_is_dynamic).sum())} static")
 
+    if ring_rv_enabled(args):
+        if not blind_origins or int(getattr(args, "cam_num", 2) or 2) != 1:
+            raise RuntimeError("ring_rv needs blind_lidar_origins and cam_num=1")
+        if getattr(args, "od_mask_gt_loss", False):
+            raise RuntimeError("ring_rv does not support od_mask_gt_loss")
+        lut_path = os.path.join(args.model_path, LUT_NAME)
+        if (args.test_only or getattr(args, "start_checkpoint", None)) and os.path.isfile(lut_path):
+            lut = load_ring_lut(lut_path)
+            print(f"[Ring RV] reused {lut_path}")
+        else:
+            # Before PCA scaling: min_range is metric.
+            lut = build_ring_lut(cam_infos, n_rings=int(getattr(args, "ring_n_rings", 128)))
+            save_ring_lut(lut_path, lut)
+            print(f"[Ring RV] saved {lut_path}")
+        set_ring_lut(args, lut)
+        print(describe_lut(lut))
+
     w2cs = np.zeros((len(cam_infos), 4, 4))
     Rs = np.stack([c.R for c in cam_infos], axis=0)
     Ts = np.stack([c.T for c in cam_infos], axis=0)
@@ -1127,7 +1162,11 @@ def readGacrtInfo(args):
         train_cam_infos = [c for c in cam_infos if c.frame_idx not in val_frame_ids]
         test_cam_infos = [c for c in cam_infos if c.frame_idx in val_frame_ids]
         from utils.blind_dead_mask import dead_mask_enabled, build_dead_masks, attach_dead_masks
-        if dead_mask_enabled(args):
+        if dead_mask_enabled(args) and ring_rv_enabled(args):
+            dead, ignore = build_ring_dead_masks(train_cam_infos, args)
+            train_cam_infos = attach_ring_dead_masks(train_cam_infos, dead, ignore)
+            test_cam_infos = attach_ring_dead_masks(test_cam_infos, dead, ignore)
+        elif dead_mask_enabled(args):
             # Statistics from train frames only; the mask is a sensor property shared with test.
             dead, ignore = build_dead_masks(train_cam_infos, args)
             train_cam_infos = attach_dead_masks(train_cam_infos, dead, ignore)

@@ -166,3 +166,11 @@ blind_dead_thresh: 0.02
 blind_dead_col_window: 2          # ± columns; bridges the QT128 azimuth-sampling gaps
 blind_dead_bottom_connected: true # exclude open sky / far-field empties
 blind_dead_ignore_dilate: 2
+# Ring-indexed RV (utils/ring_rv.py; blind_lidar_origins + cam_num=1 only). Geometry
+# stays supervised on the uniform hw grid; raydrop, the raydrop prior, the refine UNet
+# and the output cloud use one row per laser ring at that ring's native azimuth step.
+# Needs a `ring` field in the PCD. Ring elevations/steps are estimated from the data
+# and cached as {model_path}/ring_lut.npz.
+ring_rv: false
+ring_n_rings: 128
+ring_interp_rel_thresh: 0.1       # bilinear across taps within 10% depth, else nearest

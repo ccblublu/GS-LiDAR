@@ -1,12 +1,12 @@
 # GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting
 
-### [[Project]]() [[Paper]](https://arxiv.org/abs/2501.13971) 
+### [[Project]]() [[Paper]](https://arxiv.org/abs/2501.13971)
 
-> [**GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting**](https://arxiv.org/abs/2501.13971),            
-> [Junzhe Jiang](https://scholar.google.com/citations?user=gnDoDP4AAAAJ), [Chun Gu](https://sulvxiangxin.github.io/), [Yurui Chen](https://github.com/fumore), [Li Zhang](https://lzrobots.github.io)       
+> [**GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting**](https://arxiv.org/abs/2501.13971),
+> [Junzhe Jiang](https://scholar.google.com/citations?user=gnDoDP4AAAAJ), [Chun Gu](https://sulvxiangxin.github.io/), [Yurui Chen](https://github.com/fumore), [Li Zhang](https://lzrobots.github.io)
 > **ICLR 2025**
 
-**Official implementation of "GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting".** 
+**Official implementation of "GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting".**
 
 ## 🛠️ Pipeline
 <div align="center">
@@ -15,7 +15,7 @@
 
 ## Get started
 ### Environment
-```
+```bash
 # Clone the repo.
 git clone https://github.com/fudan-zvg/GS-LiDAR.git
 cd GS-LiDAR
@@ -35,14 +35,19 @@ pip install -r requirements.txt
 git clone https://gitlab.inria.fr/bkerbl/simple-knn.git
 pip install ./simple-knn
 
-# compile packages in chamfer
+# Compile Chamfer distance
 cd chamfer/chamfer3D
 python setup.py install
 cd ../..
+
+# Install panoramic 2D Gaussian rasterizer (required)
+cd diff-gaussian-rasterization-2d
+pip install .
+cd ..
 ```
 
 ### 📁 Dataset
-#### KITTI-360 dataset ([Download](https://www.cvlibs.net/datasets/kitti-360/download.php))
+#### KITTI-360 ([Download](https://www.cvlibs.net/datasets/kitti-360/download.php))
 We use sequence00 (`2013_05_28_drive_0000_sync`) for experiments in our paper. Download KITTI-360 dataset (2D images are not needed) and put them into `data/kitti360`. The folder tree is as follows:
 ```bash
 data
@@ -53,13 +58,15 @@ data
         └── data_poses
 ```
 
-Next, run KITTI-360 dataset preprocessing: (set `sequence_id`)  
+Next, run KITTI-360 dataset preprocessing: (set `sequence_id`)
 
 ```bash
 python preprocess/kitti360_to_gs.py --seq {sequence_id}
 ```
 
-After preprocessing, your folder structure should look like this:  
+Supported sequence IDs: `1538, 1728, 1908, 3353, 2350, 4950, 8120, 10200, 10750, 11400`.
+
+After preprocessing, your folder structure should look like this:
 
 ```bash
 configs
@@ -75,21 +82,20 @@ data
         └── transforms_{sequence_id}_all.json
 ```
 
-
 ### Training
-```
+```bash
 # KITTI-360
 # static
 CUDA_VISIBLE_DEVICES=0 python train.py \
---config configs/kitti360_nvs_1908.yaml \
-source_path=data/kitti360 \
-model_path=eval_output/kitti360_reconstruction/1908
+  --config configs/kitti360_nvs_1908.yaml \
+  source_path=data/kitti360 \
+  model_path=eval_output/kitti360_reconstruction/1908
 
 # dynamic
 CUDA_VISIBLE_DEVICES=0 python train.py \
---config configs/kitti360_nvs_10750.yaml \
-source_path=data/kitti360 \
-model_path=eval_output/kitti360_reconstruction/10750
+  --config configs/kitti360_nvs_10750.yaml \
+  source_path=data/kitti360 \
+  model_path=eval_output/kitti360_reconstruction/10750
 ```
 
 After training, evaluation results can be found in `{EXPERIMENT_DIR}/eval_output` directory.
@@ -97,25 +103,25 @@ The training logs will be saved in `log.txt`. If you need to display them in the
 
 ### Evaluating
 You can also use the following command to evaluate.
-```
+```bash
 # KITTI-360
 # static
 CUDA_VISIBLE_DEVICES=0 python train.py \
---config configs/kitti360_nvs_1908.yaml \
-source_path=data/kitti360 \
-model_path=eval_output/kitti360_reconstruction/1908 \
---test_only
+  --config configs/kitti360_nvs_1908.yaml \
+  source_path=data/kitti360 \
+  model_path=eval_output/kitti360_reconstruction/1908 \
+  --test_only
 
 # dynamic
 CUDA_VISIBLE_DEVICES=0 python train.py \
---config configs/kitti360_nvs_10750.yaml \
-source_path=data/kitti360 \
-model_path=eval_output/kitti360_reconstruction/10750 \
---test_only
+  --config configs/kitti360_nvs_10750.yaml \
+  source_path=data/kitti360 \
+  model_path=eval_output/kitti360_reconstruction/10750 \
+  --test_only
 ```
 
 You can visualize the lidar point cloud in 3d by using:
-```
+```bash
 python scripts/visualize_lidar_in_video.py --seq {sequence_id}
 ```
 The results will be saved in `eval_output/kitti360_reconstruction/{sequence_id}/eval/others` and will resemble the video shown below.
@@ -123,22 +129,15 @@ The results will be saved in `eval_output/kitti360_reconstruction/{sequence_id}/
 ![](assets/3d.gif)
 
 We also provide a Python script to help understand the implementation of **panorama Gaussian splatting** and the reason of choosing [2DGS](https://github.com/hbb1/2d-gaussian-splatting).
-```
+```bash
 python scripts/compare_2dgs_3dgs.py
 ```
 <div align="center">
   <img src="assets/2dgs_vs_3dgs.png"/>
 </div><br/>
 
-## Hybrid with XSIM
-
-Cross-repo fusion design (static GS-LiDAR background + XSIM dynamic instances):  
-[../docs/hybrid_gslidar_xsim_dev.md](../docs/hybrid_gslidar_xsim_dev.md)
-
-Key scripts: `configs/gacrt_static_bg.yaml`, `scripts/render_hybrid.py`
-
 ## 📜 BibTeX
-``` bibtex
+```bibtex
 @inproceedings{jiang2025gslidar,
   title={GS-LiDAR: Generating Realistic LiDAR Point Clouds with Panoramic Gaussian Splatting},
   author={Jiang, Junzhe and Gu, Chun and Chen, Yurui and Zhang, Li},

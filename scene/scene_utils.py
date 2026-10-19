@@ -33,6 +33,11 @@ class CameraInfo(NamedTuple):
     # (1, H, W): static per-sensor dead zone (forced drop) and dead + edge band (raydrop ignore).
     blind_dead_mask: np.array = None
     blind_ignore_mask: np.array = None
+    # Ring RV (utils/ring_rv.py): per-point laser ring ids, and (1, R, W) ring-space dead zone.
+    ring_ids: np.array = None
+    ego_body_ring: np.array = None
+    ring_dead_mask: np.array = None
+    ring_ignore_mask: np.array = None
 
 
 class SceneInfo(NamedTuple):

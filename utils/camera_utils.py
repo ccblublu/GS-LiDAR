@@ -129,6 +129,11 @@ def loadCam(args, id, cam_info: CameraInfo, resolution_scale):
     blind_ignore_mask = resize_dead_mask(
         getattr(cam_info, "blind_ignore_mask", None), h, w, any_pixel=True)
 
+    ring_gt = {}
+    from utils.ring_rv import ring_rv_enabled, build_camera_ring_gt
+    if ring_rv_enabled(args):
+        ring_gt = build_camera_ring_gt(args, cam_info, h, w)
+
     return Camera(
         colmap_id=cam_info.uid,
         uid=id,
@@ -151,6 +156,7 @@ def loadCam(args, id, cam_info: CameraInfo, resolution_scale):
         ego_body_intensity=ego_body_intensity,
         blind_dead_mask=blind_dead_mask,
         blind_ignore_mask=blind_ignore_mask,
+        ring_gt=ring_gt,
     )
 
 

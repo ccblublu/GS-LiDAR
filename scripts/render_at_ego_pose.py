@@ -184,20 +184,23 @@ def apply_rig_delta(cam_front, cam_back, delta_ego):
 
     We first convert the ego-local delta into a world-frame transform using the
     front camera as the rig anchor, then left-multiply both front/back camera
-    poses. This preserves their rigid relation.
+    poses. This preserves their rigid relation. ``cam_back`` may be ``None``
+    for half-only (cam_num=1) scenes.
     """
     c2w_front = c2w_from_camera(cam_front)
     world_delta = c2w_front @ delta_ego @ np.linalg.inv(c2w_front)
 
-    for cam in (cam_front, cam_back):
+    cams = (cam_front,) if cam_back is None else (cam_front, cam_back)
+    for cam in cams:
         c2w = c2w_from_camera(cam)
         update_camera_from_c2w(cam, world_delta @ c2w)
 
 
 def apply_pose_from_reference(cam_front, cam_back, ref_front, ref_back, delta_ego):
     # Start from reference rig pose, then apply a coherent rig delta.
-    for cam, ref in ((cam_front, ref_front), (cam_back, ref_back)):
-        update_camera_from_c2w(cam, c2w_from_camera(ref))
+    update_camera_from_c2w(cam_front, c2w_from_camera(ref_front))
+    if cam_back is not None and ref_back is not None:
+        update_camera_from_c2w(cam_back, c2w_from_camera(ref_back))
     apply_rig_delta(cam_front, cam_back, delta_ego)
 
 
@@ -235,7 +238,13 @@ def pano_to_lidar_with_intensity(depth, intensity, vfov, hfov):
 
 
 def stitch_gt_range_map(cam_front, cam_back, hw):
-    """Stitch GT depth/intensity panoramas from camera maps (no Gaussian render)."""
+    """Stitch GT depth/intensity panoramas from camera maps (no Gaussian render).
+
+    ``cam_back is None`` returns the single forward half at HxW.
+    """
+    if cam_back is None:
+        return cam_front.pts_depth.cuda(), cam_front.pts_intensity.cuda()
+
     h, w = hw
     breaks = (0, w // 2, 3 * w // 2, w * 2)
     gt_depth_pano = torch.zeros([1, h, w * 2], device="cuda")
@@ -274,16 +283,19 @@ def imu_from_rv_matrix(imu_from_lidar):
     return np.asarray(imu_from_lidar, dtype=np.float64) @ _RV_TO_HOUSING
 
 
-def depth_to_points_intensity(depth, intensity, vfov, T_out_from_local=None):
+def depth_to_points_intensity(depth, intensity, vfov, T_out_from_local=None, hfov=(-180, 180)):
     """Decode pano → (N,3) points + (N,1) intensity in the (optionally remapped) RV frame."""
-    points, inten = pano_to_lidar_with_intensity(depth, intensity, vfov, (-180, 180))
+    points, inten = pano_to_lidar_with_intensity(depth, intensity, vfov, hfov)
     if T_out_from_local is not None:
         points = transform_points(points, T_out_from_local)
     return points, inten
 
 
-def save_intensity_ply(depth, intensity, vfov, scale_factor, path, T_out_from_local=None):
-    points, inten = depth_to_points_intensity(depth, intensity, vfov, T_out_from_local)
+def save_intensity_ply(depth, intensity, vfov, scale_factor, path, T_out_from_local=None,
+                       hfov=(-180, 180)):
+    points, inten = depth_to_points_intensity(
+        depth, intensity, vfov, T_out_from_local, hfov=hfov,
+    )
     inten_np = inten.clamp(0, 1).detach().cpu().numpy()
     rgbs = np.repeat(inten_np, 3, axis=1)
     save_ply(points / scale_factor, path, rgbs=rgbs)
@@ -413,6 +425,8 @@ def render_offset_job(
         else list_sensor_ids(cameras)
     )
     multi_sensor = len(sensor_ids) > 1
+    half_only = int(getattr(conf, "cam_num", 2) or 2) == 1
+    ply_hfov = tuple(conf.hfov) if half_only else (-180, 180)
 
     # Blind-lidar → IMU extrinsics (source_id 1..4). Slot = source_id - 1.
     blind_extrinsics = None
@@ -430,6 +444,8 @@ def render_offset_job(
         "pose_from_frame": args_read.pose_from_frame,
         "scale_factor": conf.scale_factor,
         "ply_frame": "original_gt_rv",
+        "ply_hfov": list(ply_hfov),
+        "half_only": half_only,
         "imu_fused": bool(blind_extrinsics),
         "imu_frame": "x-forward y-left z-up meters" if blind_extrinsics else None,
         "sensor_ids": sensor_ids,
@@ -456,7 +472,8 @@ def render_offset_job(
             )
 
             restore_camera_pose(cam_front, pose_snapshots[cam_front.uid])
-            restore_camera_pose(cam_back, pose_snapshots[cam_back.uid])
+            if cam_back is not None:
+                restore_camera_pose(cam_back, pose_snapshots[cam_back.uid])
             c2w_gt = c2w_from_camera(cam_front)
 
             gt_depth, gt_inten = stitch_gt_range_map(cam_front, cam_back, [h, w])
@@ -476,7 +493,8 @@ def render_offset_job(
                 apply_rig_delta(cam_front, cam_back, delta_ego)
 
             cam_front.timestamp = timestamp
-            cam_back.timestamp = timestamp
+            if cam_back is not None:
+                cam_back.timestamp = timestamp
             c2w_novel = c2w_from_camera(cam_front)
             # Offset camera → original GT sensor frame (same origin as _gt.ply).
             T_gt_from_novel = np.linalg.inv(c2w_gt) @ c2w_novel
@@ -486,7 +504,8 @@ def render_offset_job(
             )
 
             restore_camera_pose(cam_front, pose_snapshots[cam_front.uid])
-            restore_camera_pose(cam_back, pose_snapshots[cam_back.uid])
+            if cam_back is not None:
+                restore_camera_pose(cam_back, pose_snapshots[cam_back.uid])
 
             depth_novel, inten_novel, _ = apply_raydrop_mask(
                 depth_novel[[0]], inten_novel, raydrop_novel,
@@ -501,10 +520,12 @@ def render_offset_job(
                     depth_novel, inten_novel, conf.vfov, conf.scale_factor,
                     os.path.join(output_dir, f"{frame_tag}.ply"),
                     T_out_from_local=T_gt_from_novel,
+                    hfov=ply_hfov,
                 )
                 pts_gt_rv, inten_gt_pts = save_intensity_ply(
                     gt_depth, gt_inten, conf.vfov, conf.scale_factor,
                     os.path.join(output_dir, f"{frame_tag}_gt.ply"),
+                    hfov=ply_hfov,
                 )
                 if blind_extrinsics is not None:
                     source_id = int(sid) + 1

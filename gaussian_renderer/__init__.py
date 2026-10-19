@@ -136,7 +136,8 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
     rendered_other, rendered_normal = rendered_feature.split([S_other, 3], dim=0)
     rendered_normal = rendered_normal / (rendered_normal.norm(dim=0, keepdim=True) + 1e-8)
 
-    if env_map is not None:
+    # Ring RV applies the prior per ring slot (ring_raydrop_maps), not per grid pixel.
+    if env_map is not None and not getattr(pipe, "ring_rv", False):
         lidar_raydrop_prior_from_envmap = env_map(
             viewpoint_camera.towards, getattr(viewpoint_camera, "sensor_id", 0))
         rendered_raydrop = lidar_raydrop_prior_from_envmap + (1 - lidar_raydrop_prior_from_envmap) * rendered_raydrop
@@ -276,3 +277,56 @@ def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, rende
             cam_front, cam_back, [h, w], args.vfov, args.hfov, dilate=dilate)
 
     return depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano
+
+
+def ring_raydrop_maps(args, cam, depth, intensity, raydrop, ref_depth, env_map):
+    """Sample render-grid maps at ring slots; raydrop gets the ring-space prior.
+
+    Returns depth (C,R,W), intensity (1,R,W), raydrop (1,R,W), RingGeometry.
+    """
+    from utils.ring_rv import get_geometry, sample_to_ring
+    geom = get_geometry(args, cam.sensor_id, int(cam.image_height), int(cam.image_width))
+    n_depth = depth.shape[0]
+    ring = sample_to_ring(torch.cat([depth, intensity, raydrop]), ref_depth, geom,
+                          float(getattr(args, "ring_interp_rel_thresh", 0.1)))
+    ring_raydrop = ring[n_depth + 1:]
+    if env_map is not None:
+        prior = env_map(cam.towards, getattr(cam, "sensor_id", 0))
+        ring_raydrop = prior + (1 - prior) * ring_raydrop
+    return ring[:n_depth], ring[n_depth:n_depth + 1], ring_raydrop.clamp(0, 1), geom
+
+
+def render_ring_range_map(args, cam: Camera, gaussians, renderFunc, renderArgs, env_map):
+    """Ring-RV inference for one blind-lidar camera (cam_num=1).
+
+    Returns depth (3,R,W) [mix, mean, median], intensity, raydrop, gt_depth,
+    gt_intensity (all ring space) and the RingGeometry. Unfired placeholder
+    slots and the static dead zone always drop; GT body returns are pasted.
+    """
+    depth, intensity_sh, raydrop, _, _ = _render_half_pkg(
+        cam, gaussians, renderFunc, renderArgs, env_map, args)
+    depth, intensity_sh, raydrop, geom = ring_raydrop_maps(
+        args, cam, depth, intensity_sh, raydrop, depth[[1]], env_map)
+    device = depth.device
+
+    drop = geom.slot_valid.to(device) < 0.5
+    dead = getattr(cam, "ring_dead_mask", None)
+    if dead is not None and bool(getattr(args, "blind_dead_mask", False)):
+        drop = drop | (dead.to(device) > 0.5)
+    from utils.blind_dead_mask import force_dead_drop
+    depth, intensity_sh, raydrop = force_dead_drop(depth, intensity_sh, raydrop, drop.float())
+
+    body_depth = getattr(cam, "ring_body_depth", None)
+    if getattr(args, "ego_body_infer_replace", True) and body_depth is not None:
+        from utils.ego_body_mask import paste_gt_ego_body_rv, _dilate_mask
+        clear = body_depth > 0
+        ego = getattr(cam, "ring_ego_mask", None)
+        if ego is not None:
+            clear = clear | (ego > 0.5)
+        dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+        clear = _dilate_mask(clear, dilate) * geom.slot_valid
+        depth, intensity_sh, raydrop = paste_gt_ego_body_rv(
+            depth, intensity_sh, raydrop, body_depth, cam.ring_body_intensity, clear)
+
+    return (depth, intensity_sh, raydrop,
+            cam.ring_depth.to(device), cam.ring_intensity.to(device), geom)

@@ -279,8 +279,25 @@ def render_view_depth(viewpoint, gaussians, args, background, env_map, gaussian_
 
 
 def render_range_map_masked(args, cam_front, cam_back, gaussians, background, env_map, hw, gaussian_mask=None):
-    assert cam_front.towards == "forward" and cam_back.towards == "backward"
+    """Render range maps. ``cam_back is None`` → single 180° half (cam_num=1)."""
     h, w = hw
+
+    if cam_back is None:
+        assert cam_front.towards in (None, "forward")
+        depth, intensity_sh, raydrop_render = render_view_depth(
+            cam_front, gaussians, args, background, env_map, gaussian_mask,
+        )
+        depth_gt = cam_front.pts_depth.cuda()
+        intensity_gt = cam_front.pts_intensity.cuda()
+        if getattr(args, "ego_body_infer_replace", True):
+            from utils.ego_body_mask import composite_ego_body_pano
+            dilate = int(getattr(args, "ego_body_replace_dilate", 2) or 0)
+            depth, intensity_sh, raydrop_render = composite_ego_body_pano(
+                depth, intensity_sh, raydrop_render,
+                cam_front, None, [h, w], args.vfov, args.hfov, dilate=dilate)
+        return depth, intensity_sh, raydrop_render, depth_gt, intensity_gt
+
+    assert cam_front.towards == "forward" and cam_back.towards == "backward"
     breaks = (0, w // 2, 3 * w // 2, w * 2)
 
     depth_pano = torch.zeros([3, h, w * 2], device="cuda")
@@ -428,12 +445,15 @@ def load_model(conf, iteration=None, use_raydrop=True):
 
 
 def camera_pair_for_frame(cameras, frame_idx, n_frames, sensor_id=0):
-    """Return (forward, backward) pair for one frame and one lidar sensor."""
+    """Return (forward, backward) for one frame / sensor.
+
+    With ``cam_num=1`` there is only a forward half; ``cam_back`` is ``None``.
+    """
     sensor_id = int(sensor_id)
     frame_idx = int(frame_idx)
 
     def _match(cam, towards):
-        if cam.towards != towards:
+        if towards is not None and cam.towards != towards:
             return False
         if int(getattr(cam, "sensor_id", 0)) != sensor_id:
             return False
@@ -443,12 +463,18 @@ def camera_pair_for_frame(cameras, frame_idx, n_frames, sensor_id=0):
         return cam.colmap_id % n_frames == frame_idx
 
     cam_front = next(c for c in cameras if _match(c, "forward"))
-    cam_back = next(c for c in cameras if _match(c, "backward"))
+    try:
+        cam_back = next(c for c in cameras if _match(c, "backward"))
+    except StopIteration:
+        cam_back = None
     return cam_front, cam_back
 
 
 def iter_frame_sensor_pairs(cameras, frame_ids, n_frames, sensor_ids=None):
-    """Yield (frame_idx, sensor_id, cam_front, cam_back) for each available pair."""
+    """Yield (frame_idx, sensor_id, cam_front, cam_back) for each available pair.
+
+    ``cam_back`` may be ``None`` when the scene is half-only (``cam_num=1``).
+    """
     if sensor_ids is None:
         sensor_ids = list_sensor_ids(cameras)
     for frame_idx in frame_ids:

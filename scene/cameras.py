@@ -24,6 +24,7 @@ class Camera(nn.Module):
                  sensor_id=0, frame_idx=None, ego_body_mask=None,
                  ego_body_points_cam=None, ego_body_intensity=None,
                  blind_dead_mask=None, blind_ignore_mask=None,
+                 ring_gt=None,
                  ):
         super(Camera, self).__init__()
 
@@ -60,6 +61,13 @@ class Camera(nn.Module):
         self.blind_dead_mask = blind_dead_mask.cpu() if blind_dead_mask is not None else None
         self.blind_ignore_mask = blind_ignore_mask.cpu() if blind_ignore_mask is not None else None
         self.pts_depth_input = pts_depth_input.cpu() if pts_depth_input is not None else pts_depth_input
+        # Ring RV GT (utils/ring_rv.py): ring_depth, ring_intensity, ring_body_*, ring_ego_mask,
+        # ring_dead_mask, ring_ignore_mask; each (1, R, W) on CPU or None.
+        self.has_ring_gt = bool(ring_gt)
+        for key in ("ring_depth", "ring_intensity", "ring_body_depth", "ring_body_intensity",
+                    "ring_ego_mask", "ring_dead_mask", "ring_ignore_mask"):
+            value = (ring_gt or {}).get(key)
+            setattr(self, key, value.cpu() if value is not None else None)
 
         self.zfar = 1000.0
         self.znear = 0.01
